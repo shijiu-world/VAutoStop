@@ -60,8 +60,8 @@ servers = ["lobby", "survival", "velocity"]   # 大厅和主生存别自动关�
 [mcsm]
 enabled = true          # false = 只在日志里说说「该关了」，绝不联网（调试用）
 
-url = "http://mc.com"                     # 面板地址，结尾别带斜杠
-daemon-id = "xxx"                         # 守护进程 uuid ⚠ 上线前用 /vautostop test 核对
+url = "http://127.0.0.1:24444"             # 面板地址，结尾别带斜杠（换成你自己的）
+daemon-id = "这里填守护进程 uuid"           # 守护进程 uuid ⚠ 上线前用 /vautostop test 核对
 apikey = "${env:MCSM_KEY}"                # 🔐 api-key，走环境变量；取不到会后台告警并当作空
 
 timeout-ms = 8000       # 单次请求超时（毫秒），面板卡住时不至于一直挂着
