@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  VAutoStop —— Velocity 端：定期巡检各子服人数，空服到点了就调 MCSManager 面板把实例停掉。
+
+  版本号只改这一处：
+    - templating-maven-plugin 拿它生成 BuildConstants.VERSION
+    - finalName / Release 产物名也用它
+  ⚠️ @Plugin(version = ...) 只能用常量，直接写 ${project.version} 会被注解处理器当成字面量，
+     产物里的 velocity-plugin.json 就会永远是旧版本（Vmessage v1.0.2 踩过）。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>cn.shijiu</groupId>
+    <artifactId>vautostop</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>VAutoStop</name>
+    <description>子服空服自动关机：定期巡检人数，0 人到点就调 MCSManager 面板停实例。</description>
+
+    <properties>
+        <!-- Velocity 3.4+ ~ 4.x 一律 Java 17（class 61） -->
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <build>
+        <finalName>VAutoStop-${project.version}</finalName>
+        <resources>
+            <!-- ⚠️ config.toml 绝不能进 filtering：里面有 ${env:MCSM_KEY} 这类变量，
+                 Maven 会当成自己的属性去解析（轻则吃掉，重则直接报错）。 -->
+            <resource>
+                <directory>${project.basedir}/src/main/resources</directory>
+                <filtering>true</filtering>
+                <excludes>
+                    <exclude>config.toml</exclude>
+                </excludes>
+            </resource>
+            <resource>
+                <directory>${project.basedir}/src/main/resources</directory>
+                <filtering>false</filtering>
+                <includes>
+                    <include>config.toml</include>
+                </includes>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.8.1</version>
+                <configuration>
+                    <release>${java.version}</release>
+                    <encoding>UTF-8</encoding>
+                </configuration>
+            </plugin>
+            <!-- ${project.version} → BuildConstants.VERSION → @Plugin(version = ...) -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>templating-maven-plugin</artifactId>
+                <version>1.0.0</version>
+                <executions>
+                    <execution>
+                        <id>filter-src</id>
+                        <goals>
+                            <goal>filter-sources</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <repositories>
+        <repository>
+            <id>papermc-repo</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <!-- ⚠️ provided：运行时由 Velocity 提供，产物里不放任何第三方库。 -->
+        <dependency>
+            <groupId>com.velocitypowered</groupId>
+            <artifactId>velocity-api</artifactId>
+            <version>3.2.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+</project>

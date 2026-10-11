@@ -1,0 +1,393 @@
+package cn.shijiu.vautostop;
+
+import cn.shijiu.vautostop.VasConfig.Target;
+import com.velocitypowered.api.proxy.server.RegisteredServer;
+import com.velocitypowered.api.scheduler.ScheduledTask;
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 巡检核心：到点跑一遍各子服的人数，满足条件就把停机请求发出去。
+ *
+ * <p>几个刻意的取舍：
+ * <ol>
+ *   <li><b>人数只在主线程读</b>：{@code getPlayersConnected()} 属于 Velocity 内部会话状态，
+ *       不停服的前提下跨线程读虽不一定炸，但没有必要冒险，全部包到 {@link #scheduleTick}
+ *       里由代理的主线程执行。</li>
+ *   <li><b>停机前再数一遍人数</b>：从「判定为空」到「请求发出」之间隔着一次 HTTP，
+ *       这段时间完全可能有玩家进来；第二次读到非 0 就直接放弃这一轮。</li>
+ *   <li><b>同一时刻同一个服只跑一条停机链路</b>：靠 {@link State#busy} 标记，
+ *       防止每次巡检叠加请求（尤其 verify-running 那段本来就慢）。</li>
+ *   <li><b>告警去重</b>：uuid 没配/不合法、子服不存在这类问题只报一次，
+ *       否则每 10 分钟一条，日志会被自己的提醒刷屏。</li>
+ * </ol>
+ */
+public final class IdleMonitor {
+
+    /** 某个子服的巡检状态（跨线程可见，字段一律 volatile） */
+    public static final class State {
+        /** 连续查到 0 人的次数（有人就清零） */
+        volatile long emptyChecks;
+        /** 最后一次尝试停机（或判定该尝试）的单调时钟 */
+        volatile long lastStopAttemptNanos;
+        /** 最后一次被巡检到的时间 */
+        volatile long lastCheckNanos;
+        /** 最后一次读到的人数，-1 = 还没查过 */
+        volatile int players = -1;
+        /** 累计成功发出的停机请求数 */
+        volatile long stopCount;
+        /** 最近一次动作的结论（给 /vautostop list 看） */
+        volatile String lastResult = "待巡检";
+        /** 停机链路是否正在跑（http 往返期间别再来一条） */
+        volatile boolean busy;
+    }
+
+    private final VAutoStop plugin;
+    private final Logger logger;
+    private final HttpService http;
+    private final Map<String, State> states = new ConcurrentHashMap<>();
+    private final Set<String> warned = ConcurrentHashMap.newKeySet();
+
+    private volatile ScheduledTask task;
+    private volatile VasConfig config;
+    private volatile long startedNanos;
+    private volatile long lastTickNanos;
+
+    public IdleMonitor(VAutoStop plugin, Logger logger, HttpService http) {
+        this.plugin = plugin;
+        this.logger = logger;
+        this.http = http;
+    }
+
+    // ------------------------------------------------------------------
+    // 生命周期
+    // ------------------------------------------------------------------
+
+    /** （重新）排期：每次 reload 都会走到这里，旧任务先取消 */
+    public synchronized void restart(VasConfig c) {
+        cancelTask();
+        warned.clear();
+        this.config = c;
+        this.startedNanos = System.nanoTime();
+        this.lastTickNanos = startedNanos;
+        if (c == null || !c.enabled) {
+            return;
+        }
+        long interval = c.intervalMinutes;
+        this.task = plugin.proxy().getScheduler().buildTask(plugin, () -> tick(false))
+                .delay(interval, TimeUnit.MINUTES)
+                .repeat(interval, TimeUnit.MINUTES)
+                .schedule();
+    }
+
+    /** 代理关停：停掉定时任务，别在关服过程中还在往面板发请求 */
+    public synchronized void shutdown() {
+        cancelTask();
+    }
+
+    private void cancelTask() {
+        ScheduledTask t = task;
+        task = null;
+        if (t != null) {
+            try {
+                t.cancel();
+            } catch (Exception ignored) {
+                // 取消失败无所谓，任务本就要随插件卸载消亡
+            }
+        }
+    }
+
+    /**
+     * 手动触发一次巡检（{@code /vautostop check}）。
+     *
+     * <p>force 只等于「跳过启动宽限期和重试冷却」，<b>不等于跳过连续次数</b>：
+     * 连续 {@code required-empty-checks} 次读到 0 人才动手是硬性条件，
+     * 手动巡检也一样只累加计数器 —— 想测出一次真正的关机，连着敲两次 check 即可。
+     */
+    public void scheduleTick(boolean force) {
+        plugin.runOnMain(() -> tick(force));
+    }
+
+    // ------------------------------------------------------------------
+    // 查询（给命令用）
+    // ------------------------------------------------------------------
+
+    public Map<String, State> states() {
+        return Collections.unmodifiableMap(new LinkedHashMap<>(states));
+    }
+
+    public long lastTickNanos() {
+        return lastTickNanos;
+    }
+
+    public long startedNanos() {
+        return startedNanos;
+    }
+
+    /** 满足过滤条件、且真的在被盯的子服名字（按配置里/代理里的真实名字） */
+    public List<String> watched(VasConfig c) {
+        Map<String, RegisteredServer> byLower = allServers();
+        Set<String> names = new LinkedHashSet<>();
+        for (Target t : c.targets.values()) {
+            if (t.enabled) {
+                RegisteredServer rs = byLower.get(t.name.toLowerCase(Locale.ROOT));
+                names.add(rs == null ? t.name : rs.getServerInfo().getName());
+            }
+        }
+        for (String key : byLower.keySet()) {
+            if (c.selected(key)) {
+                names.add(byLower.get(key).getServerInfo().getName());
+            }
+        }
+        // 配置里显式 enabled=false 的，即使被黑名单选中也不盯
+        List<String> out = new ArrayList<>();
+        for (String name : names) {
+            Target t = c.target(name);
+            if (t != null && !t.enabled) {
+                continue;
+            }
+            out.add(name);
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // 一轮巡检
+    // ------------------------------------------------------------------
+
+    private void tick(boolean force) {
+        lastTickNanos = System.nanoTime();
+        VasConfig c = config;
+        if (c == null || !c.enabled) {
+            return;
+        }
+        long now = lastTickNanos;
+        if (!force && now - startedNanos < c.graceMillis() * 1_000_000L) {
+            // 启动宽限期内只记不算账：刚起代理时各后端可能还在拉起来
+            return;
+        }
+
+        Map<String, RegisteredServer> byLower = allServers();
+        for (String display : watched(c)) {
+            RegisteredServer rs = byLower.get(display.toLowerCase(Locale.ROOT));
+            if (rs == null) {
+                warnOnce("missing-server:" + display,
+                        "[vautostop] 配置盯的子服 " + display + " 在 velocity.toml 的 [servers] 里并不存在，跳过");
+                continue;
+            }
+            int players = rs.getPlayersConnected().size();
+            State st = states.computeIfAbsent(display, k -> new State());
+            st.players = players;
+            st.lastCheckNanos = now;
+
+            if (players > 0) {
+                if (st.emptyChecks > 0) {
+                    logger.info("[vautostop] " + display + " 又有人了（" + players + " 人），空服计数清零");
+                }
+                st.emptyChecks = 0;
+                st.lastResult = "有人，不关";
+                continue;
+            }
+
+            st.emptyChecks++;
+            // 🔴 连续次数是铁律，/vautostop check 也不得跳过 —— 一次采样说明不了"真没人"
+            if (st.emptyChecks < c.requiredEmptyChecks) {
+                logger.info("[vautostop] " + display + " 空了第 " + st.emptyChecks + "/"
+                        + c.requiredEmptyChecks + " 次，还没到连续次数，继续观察");
+                st.lastResult = "空 " + st.emptyChecks + "/" + c.requiredEmptyChecks + " 次";
+                continue;
+            }
+            if (st.busy) {
+                logger.info("[vautostop] " + display + " 上一轮停机流程还没走完，这一轮跳过");
+                continue;
+            }
+            if (!force && now - st.lastStopAttemptNanos < c.cooldownMillis() * 1_000_000L) {
+                long waitedMin = (now - st.lastStopAttemptNanos) / 60_000_000_000L;
+                logger.info("[vautostop] " + display + " 距上次停机尝试才 " + waitedMin + " 分钟"
+                        + "（冷却 " + c.retryCooldownMinutes + " 分钟），这一轮跳过");
+                continue;
+            }
+            st.lastStopAttemptNanos = now;
+            beginStop(c, rs, st);
+        }
+    }
+
+    /**
+     * 走完一条「真的要把服关掉」的链路：查状态 → 再数一遍人数 → 发停机请求。
+     * 每一步失败都停下来，并在 {@link State#lastResult} 里留下原因。
+     */
+    private void beginStop(VasConfig c, RegisteredServer rs, State st) {
+        String name = rs.getServerInfo().getName();
+        Target t = c.target(name);
+        if (t == null) {
+            warnOnce("no-section:" + name,
+                    "[vautostop] " + name + " 空了，但没配 [servers." + name + "]，不知道该停面板上哪个实例，跳过");
+            st.lastResult = "缺 [servers." + name + "]";
+            return;
+        }
+        if (!McsmApi.looksLikeUuid(t.uuid)) {
+            warnOnce("bad-uuid:" + name,
+                    "[vautostop] " + name + " 的 uuid 不像面板实例 uuid（应为 32 位十六进制），跳过");
+            st.lastResult = "uuid 不合法";
+            return;
+        }
+        if (!c.mcsm.enabled) {
+            logger.info("[vautostop] " + name + " 已空置满足停机条件，但 [mcsm] enabled=false（调试模式），不联网");
+            st.lastResult = "面板对接关闭中";
+            return;
+        }
+        if (c.mcsm.url.isEmpty() || c.mcsm.daemonId.isEmpty()) {
+            warnOnce("bad-mcsm:", "[vautostop] [mcsm] 的 url 或 daemon-id 没填全，没法请求面板");
+            st.lastResult = "面板地址未配置";
+            return;
+        }
+
+        st.busy = true;
+        McsmApi api = new McsmApi(c);
+        long timeout = c.mcsm.timeoutMs;
+
+        CompletableFuture<Boolean> chain = CompletableFuture.completedFuture(true);
+
+        // ① verify-running：先确认实例确实是「运行中(3)」，避免对着已经停的实例反复发停止
+        if (c.mcsm.verifyRunning) {
+            String detailUrl = api.detailUrl(t);
+            String safeDetail = api.mask(detailUrl);
+            chain = chain.thenCompose(ok -> {
+                if (!ok) {
+                    return CompletableFuture.completedFuture(false);
+                }
+                return http.request(detailUrl, timeout, api.authHeaders()).handle((r, ex) -> {
+                    if (ex != null) {
+                        logger.warn("[vautostop] 查 " + name + " 的实例状态出错：" + ex.getMessage());
+                        st.lastResult = "查状态异常";
+                        return false;
+                    }
+                    if (!r.success2xx()) {
+                        logger.warn("[vautostop] 查 " + name + " 实例状态失败：HTTP " + r.code
+                                + " " + safeDetail + " 响应：" + trim(r.body));
+                        st.lastResult = "查状态 HTTP " + r.code;
+                        return false;
+                    }
+                    Integer status = api.parseStatus(r.body);
+                    if (status == null) {
+                        logger.warn("[vautostop] 读不出 " + name + " 的实例状态码，本轮不动手。响应原文："
+                                + trim(r.body));
+                        st.lastResult = "状态码解析失败";
+                        return false;
+                    }
+                    if (status != 3) {
+                        logger.info("[vautostop] " + name + " 面板上不是「运行中」（"
+                                + McsmApi.statusText(status) + "），不用停");
+                        st.lastResult = "非运行中（" + McsmApi.statusText(status) + "）";
+                        return false;
+                    }
+                    return true;
+                });
+            });
+        }
+
+        // ② 停机前再数一次人数：判空到发请求之间隔着 HTTP，这段时间可能有人进来
+        chain = chain.thenCompose(ok -> {
+            if (!ok) {
+                return CompletableFuture.completedFuture(false);
+            }
+            return countAgain(rs).thenApply(count -> {
+                if (count > 0) {
+                    logger.info("[vautostop] 正要停 " + name + " 时它又有 " + count + " 人了，取消这次关机");
+                    st.players = count;
+                    st.emptyChecks = 0;
+                    st.lastResult = "关机前有人进来";
+                    return false;
+                }
+                return true;
+            });
+        });
+
+        // ③ 真的发停机请求（或 dry-run 只打日志）
+        boolean dryRun = c.mcsm.dryRun;
+        String stopUrl = api.stopUrl(t);
+        String safeStop = api.mask(stopUrl);
+        chain = chain.thenCompose(ok -> {
+            if (!ok) {
+                return CompletableFuture.completedFuture(false);
+            }
+            if (dryRun) {
+                logger.info("[vautostop] [dry-run] " + name + " 已满足停机条件，本会调用面板停机"
+                        + "（mcsm.dry-run=true，未真正发送）" + safeStop);
+                st.lastResult = "dry-run，未发送";
+                st.stopCount++;
+                return CompletableFuture.completedFuture(true);
+            }
+            return http.request(stopUrl, timeout, api.authHeaders()).handle((r, ex) -> {
+                if (ex != null) {
+                    logger.warn("[vautostop] 停 " + name + " 时出错：" + ex.getMessage());
+                    st.lastResult = "停服请求异常";
+                    return false;
+                }
+                if (!r.success2xx()) {
+                    logger.warn("[vautostop] 停 " + name + " 失败：HTTP " + r.code + " " + safeStop
+                            + " 响应：" + trim(r.body));
+                    st.lastResult = "停服 HTTP " + r.code;
+                    return false;
+                }
+                Integer status = api.parseStatus(r.body);
+                logger.info("[vautostop] " + name + " 已请求面板停机（HTTP " + r.code
+                        + (status == null ? "" : "，面板状态码 " + McsmApi.statusText(status)) + "）");
+                st.lastResult = "已请求停机";
+                st.stopCount++;
+                st.emptyChecks = 0;
+                return true;
+            });
+        });
+
+        chain.whenComplete((ok, ex) -> {
+            st.busy = false;
+            if (ex != null) {
+                logger.warn("[vautostop] " + name + " 的停机流程意外中断：" + ex.getMessage());
+                st.lastResult = "流程异常";
+            }
+        });
+    }
+
+    /** 回到主线程数一次人数（hung 住最多 5 秒就按原人数判断是否继续） */
+    private CompletableFuture<Integer> countAgain(RegisteredServer rs) {
+        CompletableFuture<Integer> future = new CompletableFuture<>();
+        int fallback = rs.getPlayersConnected().size();
+        try {
+            plugin.runOnMain(() -> future.complete(rs.getPlayersConnected().size()));
+        } catch (RuntimeException e) {
+            future.complete(fallback);
+        }
+        return future.orTimeout(5, TimeUnit.SECONDS).exceptionally(e -> fallback);
+    }
+
+    private Map<String, RegisteredServer> allServers() {
+        Map<String, RegisteredServer> byLower = new LinkedHashMap<>();
+        for (RegisteredServer s : plugin.proxy().getAllServers()) {
+            byLower.put(s.getServerInfo().getName().toLowerCase(Locale.ROOT), s);
+        }
+        return byLower;
+    }
+
+    private void warnOnce(String key, String message) {
+        if (warned.add(key)) {
+            logger.warn(message + "（这个提醒每个问题只报一次，改完配置 /vautostop reload 后会重新计数）");
+        }
+    }
+
+    private static String trim(String body) {
+        String s = body == null ? "" : body.replaceAll("\\s+", " ").trim();
+        return s.length() > 200 ? s.substring(0, 200) + "…" : s;
+    }
+}

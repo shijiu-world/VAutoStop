@@ -1,0 +1,10 @@
+{
+  "id": "vautostop",
+  "name": "VAutoStop",
+  "version": "${project.version}",
+  "description": "子服空服自动关机：定期巡检人数，0 人到点就调 MCSManager 面板停实例。",
+  "authors": [
+    "拾玖世界"
+  ],
+  "main": "cn.shijiu.vautostop.VAutoStop"
+}
