@@ -1,5 +1,7 @@
 # VAutoStop
 
+https://github.com/shijiu-world/VAutoStop · MIT License · 拾玖世界
+
 Velocity 插件：**子服没人了就自动让 MCSManager 面板把实例停掉**。
 
 群组服往往同时挂着七八个子服——小游戏、空岛、星空谷这类小服常年没人在线，
