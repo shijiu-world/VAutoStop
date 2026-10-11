@@ -227,7 +227,8 @@ public final class AdminCommands implements SimpleCommand {
                     }
                     if (!r.success2xx()) {
                         // ⚠ URL 里带 &（?uuid=..&daemonId=..），直接发给玩家会被当颜色码吃掉 → 只进后台日志
-                        plugin.logger().warn("[vautostop] 查 " + name + " 的实例 " + shortId
+                        // 这是服主手动敲 /vautostop test 触发的，直接打 WARN 无妨（不会每轮刷）
+                        plugin.logger().warn("查 " + name + " 的实例 " + shortId
                                 + " 失败：HTTP " + r.code + " " + safeUrl);
                         return new ProbeLine("&8- " + label + "&f" + name + " &7HTTP &6" + r.code
                                 + " &7（完整地址见后台日志，apikey 已打码）", null);

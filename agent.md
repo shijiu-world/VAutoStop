@@ -33,6 +33,14 @@
 4. 🔴 **`System.nanoTime()` 的原点是任意的，别拿 0 当"很久以前"**：
    `State.lastStopAttemptNanos` 用 **负数表示「从没尝试过」**，判定收在 `VasConfig#inCooldown`。
    用 0 的话，机器刚开机那会儿 `now - 0` 会小于冷却时长 → 每个子服的**第一次停机都被误挡一轮**。
+5. 🔴 **日志分三级，别再往控制台塞过程信息**（服主明确提过：只有关服才该出日志）：
+   - `logger.info` —— **只允许**出现在「真的发了 stop」和 dry-run 演习两处。
+   - `detail(...)` —— 过程判断（没到连续次数、冷却中、实例没在跑、有人所以不关…），
+     默认 `logger.debug`，只有 `[log] verbose = true` 才提到 INFO。
+   - `warnThenDebug(key, msg)` —— 错误（面板连不上 / 非 200 / 异常）。**同一个 key 第一次打 WARN
+     带全量响应，之后降级 debug**，否则面板挂掉时每轮每实例一条 WARN 能刷满控制台。
+   ⚠ 别再用 `warnOnce` 报会重复发生的错误（它只在 reload 后报一次，之后永久静默）；
+   也别手写 `"[vautostop] "` 前缀 —— Velocity 的 logger 已经带了 `[vautostop]: `，再写一遍就是重复。
 
 ## 三、一次巡检的完整链路（`IdleMonitor#beginStop`）
 
@@ -70,7 +78,7 @@ JAVA_HOME="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64" mvn -B -o -DskipTests
 # ⚠ 离线必须带 -DskipTests：本机 .m2 缺 surefire-junit3 provider，联网才会自动下载。
 #    别为此在 pom 里写死 skipTests —— CI 那边是联网的，不需要跳。
 
-# 离线自测（不用 Velocity，72 项）
+# 离线自测（不用 Velocity，75 项）
 JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 "$JDK/javac" -encoding UTF-8 -cp target/classes -d target/test-classes tests/VasTest.java
 "$JDK/java" -cp "target/classes;target/test-classes" cn.shijiu.vautostop.VasTest

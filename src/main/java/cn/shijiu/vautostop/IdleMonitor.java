@@ -32,6 +32,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *       防止每次巡检叠加请求（尤其 verify-running 那段本来就慢）。</li>
  *   <li><b>告警去重</b>：uuid 没配/不合法、子服不存在这类问题只报一次，
  *       否则每 10 分钟一条，日志会被自己的提醒刷屏。</li>
+ *   <li><b>日志分级</b>：控制台<b>只在真的把服关了</b>（含 dry-run 演习）时才出 INFO；
+ *       「还没到连续次数」「在冷却中」「这个实例没在跑」这些每轮必然发生的判断走
+ *       {@link #detail(String)}（默认 debug）。服主想要细节就开 {@code [log] verbose}，
+ *       平时看 {@code /vautostop list} 的「上次结论」。</li>
  * </ol>
  */
 public final class IdleMonitor {
@@ -197,7 +201,7 @@ public final class IdleMonitor {
             RegisteredServer rs = byLower.get(display.toLowerCase(Locale.ROOT));
             if (rs == null) {
                 warnOnce("missing-server:" + display,
-                        "[vautostop] 配置盯的子服 " + display + " 在 velocity.toml 的 [servers] 里并不存在，跳过");
+                        "配置盯的子服 " + display + " 在 velocity.toml 的 [servers] 里并不存在，跳过");
                 continue;
             }
             int players = rs.getPlayersConnected().size();
@@ -208,7 +212,7 @@ public final class IdleMonitor {
             if (players > 0) {
                 long had = st.emptyChecks.get();
                 if (had > 0) {
-                    logger.info("[vautostop] " + display + " 又有人了（" + players + " 人），空服计数清零");
+                    detail(display + " 又有人了（" + players + " 人），空服计数清零");
                 }
                 st.emptyChecks.set(0);
                 st.lastResult = "有人，不关";
@@ -218,19 +222,19 @@ public final class IdleMonitor {
             long checks = st.emptyChecks.incrementAndGet();
             // 🔴 连续次数是铁律，/vautostop check 也不得跳过 —— 一次采样说明不了"真没人"
             if (checks < c.requiredEmptyChecks) {
-                logger.info("[vautostop] " + display + " 空了第 " + checks + "/"
+                detail(display + " 空了第 " + checks + "/"
                         + c.requiredEmptyChecks + " 次，还没到连续次数，继续观察");
                 st.lastResult = "空 " + checks + "/" + c.requiredEmptyChecks + " 次";
                 continue;
             }
             if (st.busy) {
-                logger.info("[vautostop] " + display + " 上一轮停机流程还没走完，这一轮跳过");
+                detail(display + " 上一轮停机流程还没走完，这一轮跳过");
                 continue;
             }
             // 没尝试过（负数）不算冷却 —— 详见 VasConfig#inCooldown 上那段关于 nanoTime 原点的说明
             if (!force && VasConfig.inCooldown(st.lastStopAttemptNanos, now, c.cooldownMillis())) {
                 long waitedMin = (now - st.lastStopAttemptNanos) / 60_000_000_000L;
-                logger.info("[vautostop] " + display + " 距上次停机尝试才 " + waitedMin + " 分钟"
+                detail(display + " 距上次停机尝试才 " + waitedMin + " 分钟"
                         + "（冷却 " + c.retryCooldownMinutes + " 分钟），这一轮跳过");
                 continue;
             }
@@ -252,26 +256,26 @@ public final class IdleMonitor {
         Target t = c.target(name);
         if (t == null) {
             warnOnce("no-section:" + name,
-                    "[vautostop] " + name + " 空了，但没配 [servers." + name + "]，不知道该停面板上哪个实例，跳过");
+                    name + " 空了，但没配 [servers." + name + "]，不知道该停面板上哪个实例，跳过");
             st.lastResult = "缺 [servers." + name + "]";
             return;
         }
         List<String> uuids = t.validUuids();
         if (uuids.isEmpty()) {
             warnOnce("bad-uuid:" + name,
-                    "[vautostop] " + name + " 没配可用的实例 uuid（应为 32 位十六进制），跳过"
+                    name + " 没配可用的实例 uuid（应为 32 位十六进制），跳过"
                             + (t.uuids.isEmpty() ? "：[servers." + name + "] 里连 uuid 这行都没有"
                                                  : "（写了 " + t.uuids.size() + " 个，没一个像 uuid）"));
             st.lastResult = t.uuids.isEmpty() ? "没配 uuid" : "uuid 都不合法";
             return;
         }
         if (!c.mcsm.enabled) {
-            logger.info("[vautostop] " + name + " 已空置满足停机条件，但 [mcsm] enabled=false（调试模式），不联网");
+            detail(name + " 已空置满足停机条件，但 [mcsm] enabled=false（调试模式），不联网");
             st.lastResult = "面板对接关闭中";
             return;
         }
         if (c.mcsm.url.isEmpty() || c.mcsm.daemonId.isEmpty()) {
-            warnOnce("bad-mcsm:", "[vautostop] [mcsm] 的 url 或 daemon-id 没填全，没法请求面板");
+            warnOnce("bad-mcsm:", "[mcsm] 的 url 或 daemon-id 没填全，没法请求面板");
             st.lastResult = "面板地址未配置";
             return;
         }
@@ -284,7 +288,7 @@ public final class IdleMonitor {
         // 🔴 配了多个实例，就必须先查状态才知道该停哪个 —— 这时候 verify-running 强制生效
         boolean probe = c.mcsm.verifyRunning || multi;
         if (multi && !c.mcsm.verifyRunning) {
-            warnOnce("force-probe:" + name, "[vautostop] " + name + " 配了 " + uuids.size()
+            warnOnce("force-probe:" + name, name + " 配了 " + uuids.size()
                     + " 个实例（同一端口互斥），必须逐个查状态才知道该停哪个 —— 本服强制按 verify-running=true 处理");
         }
 
@@ -294,28 +298,28 @@ public final class IdleMonitor {
 
         CompletableFuture<Boolean> chain = candidates.thenCompose(running -> {
             if (running.isEmpty()) {
-                logger.info("[vautostop] " + name + " 的 " + uuids.size() + " 个实例在面板上都不算「运行中」，不用停");
+                detail(name + " 的 " + uuids.size() + " 个实例在面板上都不算「运行中」，不用停");
                 st.lastResult = "无运行中的实例";
                 return CompletableFuture.completedFuture(false);
             }
-            logger.info("[vautostop] " + name + " 面板上正在跑的实例 " + running.size() + "/" + uuids.size()
+            detail(name + " 面板上正在跑的实例 " + running.size() + "/" + uuids.size()
                     + " 个：" + shortJoin(running));
             if (running.size() > 1) {
                 // 业务前提是「同一端口同时至多一个实例」，跑起来不止一个说明 uuid 列表可能配岔了
-                logger.warn("[vautostop] ⚠ " + name + " 本该同时至多一个实例在跑，现在却有 " + running.size()
-                        + " 个都在运行（" + shortJoin(running) + "）。仍会逐个请求停机；"
+                warnThenDebug("multi-running:" + name, "⚠ " + name + " 本该同时至多一个实例在跑，现在却有 "
+                        + running.size() + " 个都在运行（" + shortJoin(running) + "）。仍会逐个请求停机；"
                         + "如果这不是你想要的，核对一下 [servers." + name + "] 的 uuid 列表");
             }
             // ② 停机前再数一次人数：判空到发请求之间隔着 HTTP，这段时间可能有人进来
             return countAgain(rs).thenCompose(count -> {
                 if (count < 0) {
-                    logger.info("[vautostop] 正要停 " + name + " 时没能从主线程数出人数"
+                    detail("正要停 " + name + " 时没能从主线程数出人数"
                             + "（调度超时或代理正在关停），这一轮先不动手");
                     st.lastResult = "人数没数到，不敢关";
                     return CompletableFuture.completedFuture(false);
                 }
                 if (count > 0) {
-                    logger.info("[vautostop] 正要停 " + name + " 时它又有 " + count + " 人了，取消这次关机");
+                    detail("正要停 " + name + " 时它又有 " + count + " 人了，取消这次关机");
                     st.players = count;
                     st.emptyChecks.set(0);
                     st.lastResult = "关机前有人进来";
@@ -328,7 +332,7 @@ public final class IdleMonitor {
         chain.whenComplete((ok, ex) -> {
             st.busy = false;
             if (ex != null) {
-                logger.warn("[vautostop] " + name + " 的停机流程意外中断：" + ex.getMessage());
+                warnThenDebug("chain:" + name, name + " 的停机流程意外中断：" + ex.getMessage());
                 st.lastResult = "流程异常";
             }
         });
@@ -348,31 +352,33 @@ public final class IdleMonitor {
             String safeDetail = api.mask(detailUrl);
             futures.add(http.request(detailUrl, timeout, api.authHeaders()).handle((r, ex) -> {
                 if (ex != null) {
-                    logger.warn("[vautostop] 查 " + name + " 的实例 " + shortId + " 出错：" + ex.getMessage());
+                    warnThenDebug("probe-err:" + name + ":" + shortId,
+                            "查 " + name + " 的实例 " + shortId + " 出错：" + ex.getMessage());
                     st.lastResult = "查状态异常";
                     return null;
                 }
                 if (!r.success2xx()) {
-                    logger.warn("[vautostop] 查 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
-                            + " " + safeDetail + " 响应：" + trim(r.body));
+                    warnThenDebug("probe-http:" + name + ":" + shortId + ":" + r.code,
+                            "查 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
+                                    + " " + safeDetail + " 响应：" + trim(r.body));
                     st.lastResult = "查状态 HTTP " + r.code;
                     return null;
                 }
                 McsmApi.Probe p = McsmApi.probe(r.body);
                 if (p.status == null) {
                     // 「实例不存在」是这里最常见的结论 —— 多半是面板上删过的旧实例还留在配置里
-                    warnOnce("no-instance:" + name + ":" + shortId, "[vautostop] " + name + " 的实例 "
+                    warnOnce("no-instance:" + name + ":" + shortId, name + " 的实例 "
                             + shortId + " 查不到（" + p.reason + "）。如果它已经被删了，"
                             + "建议把它从 [servers." + name + "] 的 uuid 列表里去掉");
-                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 状态不明（" + p.reason + "），不停它");
+                    detail(name + " 的实例 " + shortId + " 状态不明（" + p.reason + "），不停它");
                     st.lastResult = "实例 " + shortId + " 查不到";
                     return null;
                 }
                 if (p.running()) {
-                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 正在运行 → 就停它");
+                    detail(name + " 的实例 " + shortId + " 正在运行 → 就停它");
                     running.add(uuid);
                 } else {
-                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 是「"
+                    detail(name + " 的实例 " + shortId + " 是「"
                             + McsmApi.statusText(p.status) + "」，不停它");
                 }
                 return null;
@@ -386,7 +392,7 @@ public final class IdleMonitor {
     private CompletableFuture<Boolean> sendStops(McsmApi api, String daemon, List<String> running,
                                                  long timeout, boolean dryRun, String name, State st) {
         if (dryRun) {
-            logger.info("[vautostop] [dry-run] " + name + " 已满足停机条件，本会调用面板停掉 "
+            logger.info("[dry-run] " + name + " 已满足停机条件，本会调用面板停掉 "
                     + running.size() + " 个实例：" + shortJoin(running)
                     + "（mcsm.dry-run=true，未真正发送）");
             st.lastResult = "dry-run，本会停 " + shortJoin(running);
@@ -400,18 +406,20 @@ public final class IdleMonitor {
             String safeStop = api.mask(stopUrl);
             futures.add(http.request(stopUrl, timeout, api.authHeaders()).handle((r, ex) -> {
                 if (ex != null) {
-                    logger.warn("[vautostop] 停 " + name + " 的实例 " + shortId + " 时出错：" + ex.getMessage());
+                    warnThenDebug("stop-err:" + name + ":" + shortId,
+                            "停 " + name + " 的实例 " + shortId + " 时出错：" + ex.getMessage());
                     st.lastResult = "停服请求异常";
                     return false;
                 }
                 if (!r.success2xx()) {
-                    logger.warn("[vautostop] 停 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
-                            + " " + safeStop + " 响应：" + trim(r.body));
+                    warnThenDebug("stop-http:" + name + ":" + shortId + ":" + r.code,
+                            "停 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
+                                    + " " + safeStop + " 响应：" + trim(r.body));
                     st.lastResult = "停服 HTTP " + r.code;
                     return false;
                 }
                 Integer status = api.parseStatus(r.body);
-                logger.info("[vautostop] " + name + " 的实例 " + shortId + " 已请求面板停机（HTTP " + r.code
+                logger.info(name + " 的实例 " + shortId + " 已请求面板停机（HTTP " + r.code
                         + (status == null ? "" : "，面板状态码 " + McsmApi.statusText(status)) + "）");
                 st.lastResult = "已请求停机（" + shortId + "）";
                 st.stopCount.incrementAndGet();
@@ -437,6 +445,23 @@ public final class IdleMonitor {
             out.add(McsmApi.shortUuid(u));
         }
         return String.join(", ", out);
+    }
+
+    /**
+     * 过程性日志：默认走 debug，只有 {@code [log] verbose = true} 时才提到 INFO。
+     *
+     * <p>为什么要分级：间隔设成 1 分钟时，光「冷却中，这一轮跳过」这一条就会
+     * 每分钟每个服刷一次，把真正有用的停机记录淹掉。规则是 ——
+     * <b>INFO 只留给「真的把服关了」（含 dry-run 演习），过程判断统统 debug</b>。
+     * 想看细节就开 {@code verbose}，或者用 {@code /vautostop list} 看每个服的「上次结论」。
+     */
+    private void detail(String message) {
+        VasConfig c = config;
+        if (c != null && c.verbose) {
+            logger.info(message);
+        } else {
+            logger.debug(message);
+        }
     }
 
     /**
@@ -469,6 +494,22 @@ public final class IdleMonitor {
     private void warnOnce(String key, String message) {
         if (warned.add(key)) {
             logger.warn(message + "（这个提醒每个问题只报一次，改完配置 /vautostop reload 后会重新计数）");
+        }
+    }
+
+    /**
+     * 错误日志：同一个问题<b>第一次</b>打 WARN，之后降级到 debug。
+     *
+     * <p>面板地址/密钥写错时，如果每轮每个实例都打一条 WARN，几分钟就能把控制台刷满
+     * —— 但这又确实是得让人知道的事，所以第一次一定报全（含响应原文），
+     * 之后只在 {@code verbose} 下记，日常看 {@code /vautostop list} 的「上次结论」即可。
+     * {@code /vautostop reload} 会清空去重集合，重新报一次。
+     */
+    private void warnThenDebug(String key, String message) {
+        if (warned.add(key)) {
+            logger.warn(message + "（同样的问题之后只记 debug，可用 /vautostop list 查看）");
+        } else {
+            detail(message);
         }
     }
 

@@ -120,6 +120,16 @@ public final class VasConfig {
     public final int startupGraceMinutes;
     public final int retryCooldownMinutes;
 
+    /**
+     * 过程性日志要不要打到 INFO。
+     *
+     * <p>默认 false：控制台只在<b>真的发出停机请求</b>（或 dry-run 演习）时才出日志，
+     * 「还没到连续次数」「在冷却中」「这个实例没在跑」这些每轮都会发生的判断一律走 debug，
+     * 否则一个 1 分钟间隔的巡检能把日志刷满。想排查问题时设 true，
+     * 或者用 {@code /vautostop list} 看每个服的「上次结论」。
+     */
+    public final boolean verbose;
+
     /** 配置里引用到的环境变量名（只存名字，不存值） */
     public final Set<String> envNames;
 
@@ -131,7 +141,7 @@ public final class VasConfig {
 
     private VasConfig(boolean enabled, int intervalMinutes, int requiredEmptyChecks,
                       FilterMode mode, List<String> filterServers, LinkedHashMap<String, Target> targets,
-                      Mcsm mcsm, int startupGraceMinutes, int retryCooldownMinutes,
+                      Mcsm mcsm, int startupGraceMinutes, int retryCooldownMinutes, boolean verbose,
                       Map<String, String> messages, Set<String> envNames, Set<String> envMissing) {
         this.enabled = enabled;
         this.intervalMinutes = intervalMinutes;
@@ -142,6 +152,7 @@ public final class VasConfig {
         this.mcsm = mcsm;
         this.startupGraceMinutes = startupGraceMinutes;
         this.retryCooldownMinutes = retryCooldownMinutes;
+        this.verbose = verbose;
         this.messages = messages;
         this.envNames = Collections.unmodifiableSet(envNames);
         this.envMissing = Collections.unmodifiableSet(envMissing);
@@ -214,6 +225,7 @@ public final class VasConfig {
                 mode, filterServers, targets, mcsm,
                 clamp(Toml.integer(t, "safety.startup-grace-minutes", 3), 0, 1440),
                 clamp(Toml.integer(t, "safety.retry-cooldown-minutes", 5), 0, 1440),
+                Toml.bool(t, "log.verbose", false),
                 messages, envNames, envMissing
         );
     }

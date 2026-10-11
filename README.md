@@ -53,6 +53,9 @@ dry-run = false                           # true = 只写日志、不真的停
 startup-grace-minutes = 3     # 代理起来/reload 后的前几分钟只记不算账
 retry-cooldown-minutes = 5    # 同一个服尝试过一次后，隔这么久才再试
 
+[log]
+verbose = false               # false = 只在真的停机时打日志（见下节）
+
 [servers.killer]
 uuid = ["实例uuid", "另一个实例uuid"]   # 同端口互斥：逐个查谁在跑，就停那个
 
@@ -132,9 +135,19 @@ enabled = false                          # 配着但先停用
 9. **dry-run** —— 走完所有判断、日志里写清楚"本会调用面板停机"，但不真的发请求。
 10. **读失败保留旧配置** —— config.toml 写挂了继续用上一次那份，不会变成半成品。
 
-### 想验证会不会误关
+### 日志：默认只在真的停机时才出
 
-盯日志里的这几行就够了：
+**默认 `verbose = false`**：控制台只在「真的把服关了」时打一条，`dry-run` 演习也算。
+其余每轮必然发生的判断（还没到连续次数、在冷却中、这个实例没在跑、有人所以不关……）
+一律走 debug，不打扰控制台 —— 间隔设成 1~2 分钟时它们能把日志刷满。
+
+平时想看插件在想什么，用 **`/vautostop list`**：每个服现在几个人、连续空了几次、
+上次结论是什么，都在里面。真要排查再开 `[log] verbose = true`（`/vautostop reload` 生效）。
+
+⚠ **出错不受这条限制**：面板连不上、返回非 200 这类问题，同一个错误**第一次**一定打 WARN
+并且带上响应原文，之后才降级为 debug，免得面板真挂了反而没人知道。
+
+开 `verbose` 后能看到的全过程（默认只有最后两行会出现在控制台）：
 
 ```
 [vautostop] 受监控子服：killer, bedwars, minigame, starvalley
@@ -146,8 +159,8 @@ enabled = false                          # 配着但先停用
 [vautostop] 正要停 killer 时它又有 2 人了，取消这次关机
 [vautostop] 正要停 killer 时没能从主线程数出人数（调度超时或代理正在关停），这一轮先不动手
 [vautostop] ⚠ killer 本该同时至多一个实例在跑，现在却有 2 个都在运行（aaaaaaaa, bbbbbbbb）
-[vautostop] killer 的实例 bbbbbbbb 已请求面板停机（HTTP 200，面板状态码 停止中）
-[vautostop] [dry-run] killer 已满足停机条件，本会调用面板停掉 1 个实例：bbbbbbbb（未真正发送）
+[vautostop] killer 的实例 bbbbbbbb 已请求面板停机（HTTP 200，面板状态码 停止中）   ← 默认就打这条
+[vautostop] [dry-run] killer 已满足停机条件，本会调用面板停掉 1 个实例：bbbbbbbb   ← 默认也打这条
 ```
 
 ---

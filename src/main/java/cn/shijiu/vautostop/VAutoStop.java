@@ -67,7 +67,7 @@ public final class VAutoStop {
     public void onProxyInitialization(ProxyInitializeEvent event) {
         reload(null);
         registerCommands();
-        logger.info("[vautostop] VAutoStop " + BuildConstants.VERSION
+        logger.info("VAutoStop " + BuildConstants.VERSION
                 + " 已就绪，命令 /vautostop（别名 /vas）。配置文件 plugins/vautostop/config.toml");
     }
 
@@ -100,7 +100,7 @@ public final class VAutoStop {
             proxy.getScheduler().buildTask(this, task).schedule();
         } catch (RuntimeException e) {
             // 插件卸载后调度会抛，兜住别把调用方搞崩
-            logger.debug("[vautostop] 调度失败：" + e.getMessage());
+            logger.debug("调度失败：" + e.getMessage());
         }
     }
 
@@ -128,7 +128,7 @@ public final class VAutoStop {
                 send(feedback, config.msg("reloaded"));
             }
         } catch (Exception e) {
-            logger.warn("[vautostop] config.toml 没读出来，继续用旧配置：" + e);
+            logger.warn("config.toml 没读出来，继续用旧配置：" + e);
             if (feedback != null) {
                 send(feedback, config.msg("reload-failed", "reason", String.valueOf(e)));
             }
@@ -149,30 +149,31 @@ public final class VAutoStop {
                 }
             }
         } catch (IOException e) {
-            logger.warn("[vautostop] 创建默认 config.toml 失败：" + e.getMessage());
+            logger.warn("创建默认 config.toml 失败：" + e.getMessage());
         }
         return file;
     }
 
     /** 起服/reload 后把关键配置打一遍 —— 省得改了半天不知道生没生效 */
     private void report(VasConfig c) {
-        logger.info("[vautostop] 总闸：" + (c.enabled ? "开" : "关（什么都不做）")
+        logger.info("总闸：" + (c.enabled ? "开" : "关（什么都不做）")
                 + " ｜ 每 " + c.intervalMinutes + " 分钟巡检一次"
                 + " ｜ 连续 " + c.requiredEmptyChecks + " 次 0 人才动手"
                 + " ｜ 启动宽限 " + c.startupGraceMinutes + " 分钟"
                 + " ｜ 重试冷却 " + c.retryCooldownMinutes + " 分钟");
-        logger.info("[vautostop] 过滤：" + (c.mode() == VasConfig.FilterMode.WHITELIST ? "白名单（只管列出的）"
+        logger.info("过滤：" + (c.mode() == VasConfig.FilterMode.WHITELIST ? "白名单（只管列出的）"
                 : "黑名单（列出的不管）")
                 + (c.filterServers.isEmpty() ? "，名单为空" : " " + String.join(", ", c.filterServers)));
-        logger.info("[vautostop] MCSM：" + (c.mcsm.enabled ? "联网" : "不联网（只写日志）")
+        logger.info("日志：过程性日志" + (c.verbose ? "开（verbose）" : "关（只在真的停机时打）") + " ｜ 细节可用 /vautostop list 看");
+        logger.info("MCSM：" + (c.mcsm.enabled ? "联网" : "不联网（只写日志）")
                 + " ｜ " + (c.mcsm.url.isEmpty() ? "⚠ url 没填" : c.mcsm.url)
                 + " ｜ 停止前查状态=" + c.mcsm.verifyRunning
                 + " ｜ dry-run=" + c.mcsm.dryRun);
-        logger.info("[vautostop] 受监控子服：" + (monitor.watched(c).isEmpty()
+        logger.info("受监控子服：" + (monitor.watched(c).isEmpty()
                 ? "无" : String.join(", ", monitor.watched(c))));
 
         if (!c.envMissing.isEmpty()) {
-            logger.warn("[vautostop] 这些环境变量没设置，相关项按空处理：" + String.join(", ", c.envMissing)
+            logger.warn("这些环境变量没设置，相关项按空处理：" + String.join(", ", c.envMissing)
                     + "（要在开服脚本里 export 再启动代理）");
         }
         List<String> bad = new ArrayList<>();
@@ -182,7 +183,7 @@ public final class VAutoStop {
             }
         }
         if (!bad.isEmpty()) {
-            logger.warn("[vautostop] 这些子服没配可用的实例 uuid，盯到了也不会关："
+            logger.warn("这些子服没配可用的实例 uuid，盯到了也不会关："
                     + String.join(", ", bad) + "（uuid 是面板实例地址栏那串 32 位十六进制，可以写成列表）");
         }
     }

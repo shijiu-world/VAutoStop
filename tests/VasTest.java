@@ -33,12 +33,20 @@ public final class VasTest {
         // ---------- 随包模板的基本默认值 ----------
         VasConfig c = VasConfig.load(table);
         check("随包模板 enabled = true", c.enabled);
-        check("随包模板间隔 10 分钟", c.intervalMinutes == 10);
+        check("随包模板间隔 2 分钟", c.intervalMinutes == 2);
         check("随包模板连续次数默认 2", c.requiredEmptyChecks == 2);
         check("随包模板停机前查状态 = true", c.mcsm.verifyRunning);
         check("随包模板 dry-run = false", !c.mcsm.dryRun);
         check("随包模板宽限 3 分钟", c.startupGraceMinutes == 3);
         check("随包模板冷却 5 分钟", c.retryCooldownMinutes == 5);
+        check("随包模板默认不开 verbose（只在停机时打日志）", !c.verbose);
+
+        Map<String, Object> loud = new LinkedHashMap<>(table);
+        loud.put("log.verbose", true);
+        check("log.verbose = true 能开出来", VasConfig.load(loud).verbose);
+
+        Map<String, Object> noLog = new LinkedHashMap<>(table);
+        check("模板里没写 [log] 就按 false", !VasConfig.load(noLog).verbose);
         check("宽限/冷却换算成毫秒", c.graceMillis() == 180_000L && c.cooldownMillis() == 300_000L);
         // ---------- 冷却窗口：「从没尝试过」不能被当成「刚尝试过」----------
         long cd = 300_000L;                       // 5 分钟
