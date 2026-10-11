@@ -4,7 +4,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -37,7 +39,14 @@ public final class VasTest {
         check("随包模板 dry-run = false", !c.mcsm.dryRun);
         check("随包模板宽限 3 分钟", c.startupGraceMinutes == 3);
         check("随包模板冷却 5 分钟", c.retryCooldownMinutes == 5);
-        check("enable/interval 换算成毫秒", c.intervalMillis() == 600_000L && c.cooldownMillis() == 300_000L);
+        check("宽限/冷却换算成毫秒", c.graceMillis() == 180_000L && c.cooldownMillis() == 300_000L);
+        // ---------- 冷却窗口：「从没尝试过」不能被当成「刚尝试过」----------
+        long cd = 300_000L;                       // 5 分钟
+        long twoMin = 120_000_000_000L;           // 代理跑了 2 分钟（模拟刚开机时 nanoTime 很小）
+        check("从没尝试过不算冷却中", !VasConfig.inCooldown(-1L, twoMin, cd));
+        check("刚尝试过算冷却中", VasConfig.inCooldown(twoMin - 60_000_000_000L, twoMin, cd));
+        check("超过冷却窗口就放行", !VasConfig.inCooldown(twoMin - 400_000_000_000L, twoMin, cd));
+        check("冷却为 0 分钟时永不算冷却中", !VasConfig.inCooldown(twoMin, twoMin, 0L));
 
         // ---------- 连续次数的铁律 ----------
         Map<String, Object> one = new LinkedHashMap<>(table);
@@ -101,7 +110,24 @@ public final class VasTest {
         mixed.put("servers.killer.uuid", new ArrayList<>(java.util.List.of(UUID_A, "实例uuid", UUID_B)));
         check("validUuids 只留合法的那几个",
                 VasConfig.load(mixed).target("killer").validUuids().equals(java.util.List.of(UUID_A, UUID_B)));
+        // ⚠ 别照着终端抄这串数字：要改就用 PowerShell 打 [int]$c 核对，屏幕上的顺序可能是乱的
         check("uuid 缩写成前 8 位", "01234567".equals(McsmApi.shortUuid(UUID_A)));
+
+        // ---------- 多行 uuid 列表（服主写列表时最常见的写法，必须能解析） ----------
+        Map<String, Object> ml = Toml.parse(
+                "[servers.killer]\n"
+                        + "uuid = [\n"
+                        + "    \"" + UUID_A + "\",   # 一号游戏\n"
+                        + "    \"" + UUID_B + "\",\n"
+                        + "]\n"
+                        + "enabled = true   # 注释里带 ] 和 ,\n");
+        VasConfig mlc = VasConfig.load(ml);
+        check("多行 uuid 列表能解析出来", mlc.target("killer").uuids.equals(java.util.List.of(UUID_A, UUID_B)));
+        check("多行列表里的行尾注释没串进值",
+                McsmApi.looksLikeUuid(mlc.target("killer").uuids.get(0)));
+        check("多行列表后面紧跟的 enabled 没被吃掉", mlc.target("killer").enabled);
+        check("多行列表的多个实例都能拼出查状态地址",
+                mlc.target("killer").validUuids().size() == 2);
 
         // ---------- 环境变量 ----------
         Map<String, String> fake = new LinkedHashMap<>();
@@ -174,6 +200,32 @@ public final class VasTest {
         noKey.put("mcsm.apikey", "");
         McsmApi nk = new McsmApi(VasConfig.load(noKey));
         check("没配密钥就不带 apikey 参数", !nk.stopUrl(killer, UUID_A).contains("apikey="));
+        // ---------- apikey 也支持 ${env:XX:-兜底值} ----------
+        Map<String, Object> fallback = new LinkedHashMap<>(real);
+        fallback.put("mcsm.apikey", "${env:VAS_API_KEY:-fallback-secret}");
+        VasConfig fc = VasConfig.load(fallback);
+        check("apikey 能取 env 兜底值", "fallback-secret".equals(fc.mcsm.apikey));
+        check("用了兜底值不算 missing", !fc.envMissing.contains("VAS_API_KEY"));
+        check("兜底值会拼进 URL", new McsmApi(fc).stopUrl(fc.target("killer"), UUID_A)
+                .contains("apikey=fallback-secret"));
+
+        // 优先级要在 env() 展开器上验：load() 走的是真实系统环境变量，测试里改不动
+        fake.put("PREC_KEY", "real-secret");
+        check("环境变量存在时优先于兜底值",
+                "real-secret".equals(VasConfig.env("${env:PREC_KEY:-fallback-secret}",
+                        k -> fake.get(k), null, null)));
+        check("环境变量没设才落到兜底值",
+                "fallback-secret".equals(VasConfig.env("${env:NOPE_KEY:-fallback-secret}",
+                        k -> fake.get(k), null, null)));
+        Set<String> miss = new LinkedHashSet<>();
+        Set<String> names = new LinkedHashSet<>();
+        VasConfig.env("${env:TOTALLY_ABSENT}", k -> fake.get(k), names, miss);
+        check("没兜底值又没环境变量 → 展开成空", "".equals(
+                VasConfig.env("${env:TOTALLY_ABSENT}", k -> fake.get(k), null, null)));
+        check("没兜底值的情况会被记进 missing", miss.contains("TOTALLY_ABSENT")
+                && names.contains("TOTALLY_ABSENT"));
+        check("同一个值里多处 ${env:} 都能展开", "x-real-secret-y-real-secret".equals(
+                VasConfig.env("x-${env:PREC_KEY}-y-${env:PREC_KEY}", k -> fake.get(k), null, null)));
 
         // ---------- 文案 ----------
         check("缺 key 时用内置默认", c.msg("list-none").contains("没有符合过滤条件"));

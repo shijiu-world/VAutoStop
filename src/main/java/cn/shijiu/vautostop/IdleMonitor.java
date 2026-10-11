@@ -16,6 +16,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 巡检核心：到点跑一遍各子服的人数，满足条件就把停机请求发出去。
@@ -35,18 +36,31 @@ import java.util.concurrent.TimeUnit;
  */
 public final class IdleMonitor {
 
-    /** 某个子服的巡检状态（跨线程可见，字段一律 volatile） */
+    /** 某个子服的巡检状态（跨线程可见：字段 volatile，会被多线程写的计数器用 AtomicLong） */
     public static final class State {
-        /** 连续查到 0 人的次数（有人就清零） */
-        volatile long emptyChecks;
-        /** 最后一次尝试停机（或判定该尝试）的单调时钟 */
-        volatile long lastStopAttemptNanos;
+        /**
+         * 连续查到 0 人的次数（有人就清零）。
+         *
+         * <p>用 AtomicLong 而不是 volatile long：主线程的 tick() 在 {@code ++}，
+         * 而停机回调线程可能跨线程把它清零 —— {@code volatile long} 的 ++ 不是原子操作，
+         * 两边恰好撞上会丢一次计数。
+         */
+        final AtomicLong emptyChecks = new AtomicLong();
+        /**
+         * 最后一次尝试停机的单调时钟；<b>负数 = 从没尝试过</b>。
+         *
+         * <p>🔴 不能留 0 当"很久以前"：{@code System.nanoTime()} 的原点是<b>任意的</b>，
+         * 有些 JVM/系统上它就是 JVM 启动时刻（机器刚开机时只有几十秒）。那样一来
+         * {@code now - 0} 小于冷却时间，会被误判成"刚停过、还在冷却"，
+         * 把每个子服的第一次停机都白白推迟一轮。没尝试过就是没尝试过，用负数显式表达。
+         */
+        volatile long lastStopAttemptNanos = -1;
         /** 最后一次被巡检到的时间 */
         volatile long lastCheckNanos;
         /** 最后一次读到的人数，-1 = 还没查过 */
         volatile int players = -1;
-        /** 累计成功发出的停机请求数 */
-        volatile long stopCount;
+        /** 累计成功发出的停机请求数（跨线程写，所以用 AtomicLong） */
+        final AtomicLong stopCount = new AtomicLong();
         /** 最近一次动作的结论（给 /vautostop list 看） */
         volatile String lastResult = "待巡检";
         /** 停机链路是否正在跑（http 往返期间别再来一条） */
@@ -192,27 +206,29 @@ public final class IdleMonitor {
             st.lastCheckNanos = now;
 
             if (players > 0) {
-                if (st.emptyChecks > 0) {
+                long had = st.emptyChecks.get();
+                if (had > 0) {
                     logger.info("[vautostop] " + display + " 又有人了（" + players + " 人），空服计数清零");
                 }
-                st.emptyChecks = 0;
+                st.emptyChecks.set(0);
                 st.lastResult = "有人，不关";
                 continue;
             }
 
-            st.emptyChecks++;
+            long checks = st.emptyChecks.incrementAndGet();
             // 🔴 连续次数是铁律，/vautostop check 也不得跳过 —— 一次采样说明不了"真没人"
-            if (st.emptyChecks < c.requiredEmptyChecks) {
-                logger.info("[vautostop] " + display + " 空了第 " + st.emptyChecks + "/"
+            if (checks < c.requiredEmptyChecks) {
+                logger.info("[vautostop] " + display + " 空了第 " + checks + "/"
                         + c.requiredEmptyChecks + " 次，还没到连续次数，继续观察");
-                st.lastResult = "空 " + st.emptyChecks + "/" + c.requiredEmptyChecks + " 次";
+                st.lastResult = "空 " + checks + "/" + c.requiredEmptyChecks + " 次";
                 continue;
             }
             if (st.busy) {
                 logger.info("[vautostop] " + display + " 上一轮停机流程还没走完，这一轮跳过");
                 continue;
             }
-            if (!force && now - st.lastStopAttemptNanos < c.cooldownMillis() * 1_000_000L) {
+            // 没尝试过（负数）不算冷却 —— 详见 VasConfig#inCooldown 上那段关于 nanoTime 原点的说明
+            if (!force && VasConfig.inCooldown(st.lastStopAttemptNanos, now, c.cooldownMillis())) {
                 long waitedMin = (now - st.lastStopAttemptNanos) / 60_000_000_000L;
                 logger.info("[vautostop] " + display + " 距上次停机尝试才 " + waitedMin + " 分钟"
                         + "（冷却 " + c.retryCooldownMinutes + " 分钟），这一轮跳过");
@@ -284,12 +300,24 @@ public final class IdleMonitor {
             }
             logger.info("[vautostop] " + name + " 面板上正在跑的实例 " + running.size() + "/" + uuids.size()
                     + " 个：" + shortJoin(running));
+            if (running.size() > 1) {
+                // 业务前提是「同一端口同时至多一个实例」，跑起来不止一个说明 uuid 列表可能配岔了
+                logger.warn("[vautostop] ⚠ " + name + " 本该同时至多一个实例在跑，现在却有 " + running.size()
+                        + " 个都在运行（" + shortJoin(running) + "）。仍会逐个请求停机；"
+                        + "如果这不是你想要的，核对一下 [servers." + name + "] 的 uuid 列表");
+            }
             // ② 停机前再数一次人数：判空到发请求之间隔着 HTTP，这段时间可能有人进来
             return countAgain(rs).thenCompose(count -> {
+                if (count < 0) {
+                    logger.info("[vautostop] 正要停 " + name + " 时没能从主线程数出人数"
+                            + "（调度超时或代理正在关停），这一轮先不动手");
+                    st.lastResult = "人数没数到，不敢关";
+                    return CompletableFuture.completedFuture(false);
+                }
                 if (count > 0) {
                     logger.info("[vautostop] 正要停 " + name + " 时它又有 " + count + " 人了，取消这次关机");
                     st.players = count;
-                    st.emptyChecks = 0;
+                    st.emptyChecks.set(0);
                     st.lastResult = "关机前有人进来";
                     return CompletableFuture.completedFuture(false);
                 }
@@ -362,7 +390,7 @@ public final class IdleMonitor {
                     + running.size() + " 个实例：" + shortJoin(running)
                     + "（mcsm.dry-run=true，未真正发送）");
             st.lastResult = "dry-run，本会停 " + shortJoin(running);
-            st.stopCount += running.size();
+            st.stopCount.addAndGet(running.size());
             return CompletableFuture.completedFuture(true);
         }
         List<CompletableFuture<Boolean>> futures = new ArrayList<>();
@@ -386,8 +414,8 @@ public final class IdleMonitor {
                 logger.info("[vautostop] " + name + " 的实例 " + shortId + " 已请求面板停机（HTTP " + r.code
                         + (status == null ? "" : "，面板状态码 " + McsmApi.statusText(status)) + "）");
                 st.lastResult = "已请求停机（" + shortId + "）";
-                st.stopCount++;
-                st.emptyChecks = 0;
+                st.stopCount.incrementAndGet();
+                st.emptyChecks.set(0);
                 return true;
             }));
         }
@@ -411,16 +439,23 @@ public final class IdleMonitor {
         return String.join(", ", out);
     }
 
-    /** 回到主线程数一次人数（hung 住最多 5 秒就按原人数判断是否继续） */
+    /**
+     * 回到主线程再数一次人数。返回 -1 = <b>没数出来</b>（调度超时、代理正在关停都走这条）。
+     *
+     * <p>⚠ 刻意不在调用线程先读一次当兜底：调用方是 HTTP 回调线程，而 {@code getPlayersConnected()}
+     * 属于 Velocity 内部会话状态，只能在主线程碰。拿不到就老实返回 -1，让调用方按
+     * 「人数不明」处理 —— 这是关服插件，不确定就该往不关那边倒，而不是拿个数碰运气。
+     */
     private CompletableFuture<Integer> countAgain(RegisteredServer rs) {
         CompletableFuture<Integer> future = new CompletableFuture<>();
-        int fallback = rs.getPlayersConnected().size();
-        try {
-            plugin.runOnMain(() -> future.complete(rs.getPlayersConnected().size()));
-        } catch (RuntimeException e) {
-            future.complete(fallback);
-        }
-        return future.orTimeout(5, TimeUnit.SECONDS).exceptionally(e -> fallback);
+        plugin.runOnMain(() -> {
+            try {
+                future.complete(rs.getPlayersConnected().size());
+            } catch (RuntimeException e) {
+                future.complete(-1);
+            }
+        });
+        return future.orTimeout(5, TimeUnit.SECONDS).exceptionally(e -> -1);
     }
 
     private Map<String, RegisteredServer> allServers() {

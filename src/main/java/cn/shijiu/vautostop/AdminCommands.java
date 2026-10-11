@@ -19,7 +19,8 @@ import java.util.concurrent.CompletableFuture;
  * <pre>
  *   /vautostop              等同于 /vautostop list
  *   /vautostop list         看在盯哪些服、每服现在几个人、上次动作是什么
- *   /vautostop check        立刻跑一轮巡检（跳过"连续几次"和冷却，收到'<几个'就动手）
+ *   /vautostop check        立刻跑一轮巡检（只跳过"启动宽限期"和"重试冷却"，
+ *                           连续几次 0 人这条<b>照算</b>，所以空服要连敲两次才会真动手）
  *   /vautostop test         逐个子服查一次面板实例状态，验证 url/uuid/密钥对不对
  *   /vautostop reload       重读 config.toml 并按新间隔重新排期
  *   /vautostop version      版本号
@@ -156,7 +157,7 @@ public final class AdminCommands implements SimpleCommand {
             plugin.send(source, c.msg("list-line",
                     "server", name,
                     "players", players,
-                    "empty", String.valueOf(st == null ? 0 : st.emptyChecks),
+                    "empty", String.valueOf(st == null ? 0 : st.emptyChecks.get()),
                     "checks", String.valueOf(c.requiredEmptyChecks),
                     "uuid", uuid,
                     "note", note));

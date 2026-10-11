@@ -191,7 +191,8 @@ public final class Toml {
     private static void add(List<String> list, StringBuilder s) {
         String item = s.toString().trim();
         if (!item.isEmpty()) {
-            list.add(item);
+            // 跟单值那条路径保持一致：数组元素里若写了转义也得还原
+            list.add(unescape(item));
         }
     }
 

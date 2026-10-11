@@ -92,12 +92,12 @@ public final class VasConfig {
 
     static {
         Map<String, String> m = new LinkedHashMap<>();
-        m.put("prefix", "&6[VAutoStop] &r");
         m.put("no-permission", "&c你没有权限使用这个命令（需要 vautostop.admin）");
         m.put("usage", "&7用法：&a/vautostop &7[list|check|test|reload|version]");
         m.put("reloaded", "&a配置已重载，巡检任务已按新的间隔重新排期");
         m.put("reload-failed", "&c配置读取失败，继续用旧配置：%reason%");
-        m.put("disabled", "&7总闸是关的（config.toml 第一行 enabled = false），什么都不做");
+        // ⚠ 别往这里塞只在 DEFAULT 里存在、代码却从没 msg(key) 过的条目：
+        //   服主在 [messages] 里改了它不会生效，只会让人以为插件坏了。
         m.put("list-header", "&6========== VAutoStop ==========");
         m.put("list-summary", "&7总闸 %state%&7 ｜ 每 &e%interval% &7分钟查一次 ｜ 连续空 &e%checks% &7次才动手 ｜ %mode%&7%servers%");
         m.put("list-next", "&7下次巡检：约 &e%next% &7分钟后");
@@ -106,8 +106,6 @@ public final class VasConfig {
         m.put("check-done", "&a已按当前人数跑了一轮巡检（同一个服要连续这样 %checks% 次没人才会真关机）");
         m.put("test-none", "&7没有可查的子服（都是没配 uuid 或面板关了的）");
         m.put("test-start", "&7正在向面板查询 %count% 个实例的状态…");
-        m.put("test-ok", "&8- &f%server% &7HTTP &e%code% &7｜实例 &e%status%");
-        m.put("test-fail", "&8- &f%server% &c请求失败 &7%error%");
         m.put("version", "&7VAutoStop &ev%version% &7（Velocity 端 · 拾玖世界）");
         DEFAULT_MESSAGES = Collections.unmodifiableMap(m);
     }
@@ -308,16 +306,26 @@ public final class VasConfig {
         return serverName == null ? null : targetsByLower.get(serverName.toLowerCase(Locale.ROOT));
     }
 
-    public long intervalMillis() {
-        return intervalMinutes * 60_000L;
-    }
-
     public long graceMillis() {
         return startupGraceMinutes * 60_000L;
     }
 
     public long cooldownMillis() {
         return retryCooldownMinutes * 60_000L;
+    }
+
+    /**
+     * 距离上次尝试停机，现在是不是还在冷却窗口里。
+     *
+     * <p>🔴 {@code lastAttemptNanos} 传<b>负数表示"从没尝试过"</b>，一律不算冷却中。
+     * 别用 0 顶替：{@code System.nanoTime()} 的原点是任意的，机器刚开机时它可能只有几十秒，
+     * 那样 {@code now - 0} 会小于冷却时长 —— 每个子服的第一次停机都被白白推迟一轮。
+     */
+    public static boolean inCooldown(long lastAttemptNanos, long nowNanos, long cooldownMillis) {
+        if (lastAttemptNanos < 0) {
+            return false;
+        }
+        return nowNanos - lastAttemptNanos < cooldownMillis * 1_000_000L;
     }
 
     /** 取一条文案，支持 %key% 占位符：参数是 key、value 成对出现 */

@@ -28,6 +28,11 @@
 3. 🔴 **主线程只干事、不等事**：人数只在主线程读（统一走 `VAutoStop#runOnMain`），
    HTTP 全在 `HttpService` 自己的线程池上；往回顶主线程再给玩家发消息。
    千万别在主线程 `join()` 任何 HTTP future（`/vautostop test` 踩过：改成 `allOf(...).whenComplete(...)`）。
+   ⚠ 停机链路是在 **HTTP 回调线程**里继续往下走的，所以那里**不许**直接调
+   `rs.getPlayersConnected()` 兜底（曾经这么干过）—— 数不出来就返回 -1，按「人数不明」处理。
+4. 🔴 **`System.nanoTime()` 的原点是任意的，别拿 0 当"很久以前"**：
+   `State.lastStopAttemptNanos` 用 **负数表示「从没尝试过」**，判定收在 `VasConfig#inCooldown`。
+   用 0 的话，机器刚开机那会儿 `now - 0` 会小于冷却时长 → 每个子服的**第一次停机都被误挡一轮**。
 
 ## 三、一次巡检的完整链路（`IdleMonitor#beginStop`）
 
@@ -35,7 +40,7 @@
 ① 取 Target.validUuids()（过滤掉占位/非法值；一个都没有就跳过）
 → ② 宽限期/连续次数/冷却
 → ③ 逐个 uuid 查 /api/instance（多个 uuid 时强制），只保留 status==3 的
-→ ④ 回主线程再数一遍人数（非 0 就放弃）
+→ ④ 回主线程再数一遍人数（非 0 就放弃；-1 = 没数出来，同样放弃）
 → ⑤ 对留在候选里的每个 uuid 发 /api/protected_instance/stop（或 dry-run 只记日志）
 ```
 ③ 由 `IdleMonitor#probeRunning` 负责（并行发请求，`allOf` 汇合），⑤ 是 `sendStops`。
@@ -65,7 +70,7 @@ JAVA_HOME="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64" mvn -B -o -DskipTests
 # ⚠ 离线必须带 -DskipTests：本机 .m2 缺 surefire-junit3 provider，联网才会自动下载。
 #    别为此在 pom 里写死 skipTests —— CI 那边是联网的，不需要跳。
 
-# 离线自测（不用 Velocity，56 项）
+# 离线自测（不用 Velocity，72 项）
 JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 "$JDK/javac" -encoding UTF-8 -cp target/classes -d target/test-classes tests/VasTest.java
 "$JDK/java" -cp "target/classes;target/test-classes" cn.shijiu.vautostop.VasTest
@@ -77,6 +82,20 @@ JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 `velocity-plugin.json` 的 `version` 字段。
 
 ## 六、踩过的坑
+
+- 🔴 **跨线程写的计数器不能用 `volatile long`**：主线程的 tick 在 `emptyChecks++`，
+  停机回调线程同时可能在清零 —— `++` 不是原子操作，会丢一次计数。这两个字段现在是 `AtomicLong`。
+- 📌 **`DEFAULT_MESSAGES` 里只放代码真正 `msg(key)` 过的条目**：曾经留了四条从来没
+  接线的 key，服主在 `[messages]` 里改了毫无效果，只会白白怀疑插件坏了。
+  同理 `intervalMillis()` 生产代码从不引用 —— 删掉，别留只有测试在用的僵尸 API。
+- 📌 **自研 TOML 的数组元素也要走 `unescape`**：曾经只有单值那条路径处理转义，
+  数组里写了转义序列就原样留着反斜杠，两边行为不一致。
+- 📌 **「多个实例同时在跑」要出警告**：服主的前提是同一端口同时至多一个实例，
+  真出现多个说明 uuid 列表可能配岔了。做法是 **照停 + 日志打警示**（不停反而是猜），
+  `/vautostop test` 也会汇总告诉你是哪几个。
+- 🔴 **在测试里验证「依赖真实系统状态」的行为必然失败**：`VasConfig#load` 读的是
+  `System::getenv`，测试里塞的假 map 管不到。要验 env 优先级就调 `env(text, lookup, …)` 
+  那个带自定义 lookup 的重载。
 
 - 🔴 `RegisteredServer` 在 **`com.velocitypowered.api.proxy.server.RegisteredServer`**，
   不是 `com.velocitypowered.api.proxy.RegisteredServer`（第一次编译就栽在这儿）。
