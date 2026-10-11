@@ -299,6 +299,10 @@ public final class IdleMonitor {
         CompletableFuture<Boolean> chain = candidates.thenCompose(running -> {
             if (running.isEmpty()) {
                 detail(name + " 的 " + uuids.size() + " 个实例在面板上都不算「运行中」，不用停");
+                // 面板上根本没实例在跑 = 这个子服压根不在线，人数恒为 0，
+                // 「连续空」会一路涨出「58/2」这种数字。清零：等服务真上线再重新数。
+                // 下方冷却照旧挡着，不会因为清零就每轮都去怼面板。
+                st.emptyChecks.set(0);
                 st.lastResult = "无运行中的实例";
                 return CompletableFuture.completedFuture(false);
             }
