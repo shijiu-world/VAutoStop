@@ -177,13 +177,13 @@ public final class VAutoStop {
         }
         List<String> bad = new ArrayList<>();
         for (VasConfig.Target t : c.targets.values()) {
-            if (!McsmApi.looksLikeUuid(t.uuid)) {
+            if (t.validUuids().isEmpty()) {
                 bad.add(t.name + (t.enabled ? "" : "(已停用)"));
             }
         }
         if (!bad.isEmpty()) {
-            logger.warn("[vautostop] 这些子服的 uuid 还没配/不合法，盯到了也不会关："
-                    + String.join(", ", bad) + "（uuid 是面板实例地址栏那串 32 位十六进制）");
+            logger.warn("[vautostop] 这些子服没配可用的实例 uuid，盯到了也不会关："
+                    + String.join(", ", bad) + "（uuid 是面板实例地址栏那串 32 位十六进制，可以写成列表）");
         }
     }
 

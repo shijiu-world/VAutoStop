@@ -140,12 +140,17 @@ public final class AdminCommands implements SimpleCommand {
             String uuid;
             if (t == null) {
                 uuid = "&c没配 [servers." + name + "]";
-            } else if (!McsmApi.looksLikeUuid(t.uuid)) {
-                uuid = "&cuuid 不合法";
-            } else if (t.daemonId != null && !t.daemonId.isEmpty()) {
-                uuid = "&7" + t.uuid + " &8(独立守护)";
             } else {
-                uuid = "&7" + t.uuid;
+                List<String> valid = t.validUuids();
+                String daemon = (t.daemonId != null && !t.daemonId.isEmpty()) ? " &8(独立守护)" : "";
+                if (valid.isEmpty()) {
+                    uuid = "&c" + (t.uuids.isEmpty() ? "没配 uuid"
+                            : t.uuids.size() + " 个 uuid 都不合法");
+                } else if (valid.size() == 1) {
+                    uuid = "&7" + valid.get(0) + daemon;
+                } else {
+                    uuid = "&7" + valid.size() + " 个实例&8(" + shortJoin(valid) + ")" + daemon;
+                }
             }
             String note = st == null ? "还没巡检过" : st.lastResult;
             plugin.send(source, c.msg("list-line",
@@ -162,7 +167,21 @@ public final class AdminCommands implements SimpleCommand {
     // test
     // ------------------------------------------------------------------
 
-    /** 向面板查一次每个受监控子服的实例状态：能查到 = 地址/uuid/密钥都对 */
+    /** 一次查询的结果：给玩家看的一行 + 它算不算「运行中」（null = 没能读出状态） */
+    private static final class ProbeLine {
+        final String text;
+        final Boolean running;
+
+        ProbeLine(String text, Boolean running) {
+            this.text = text;
+            this.running = running;
+        }
+    }
+
+    /**
+     * 向面板逐个 uuid 查一次实例状态：能查到 = 地址/uuid/密钥都对。
+     * 配了多个实例的子服会每个 uuid 都查一遍，顺带告诉服主「现在到底哪个在跑」。
+     */
     private void test(CommandSource source, VasConfig c) {
         if (!c.mcsm.enabled) {
             plugin.send(source, "&c[mcsm] enabled = false，插件现在不联网，测不了");
@@ -174,8 +193,10 @@ public final class AdminCommands implements SimpleCommand {
         }
         McsmApi api = new McsmApi(c);
         List<String> watched = plugin.monitor().watched(c);
-        Map<String, CompletableFuture<String>> pending = new LinkedHashMap<>();
         List<String> skipped = new ArrayList<>();
+        // 子服名 → 它那几个 uuid 各自的查询结果
+        Map<String, List<CompletableFuture<ProbeLine>>> byServer = new LinkedHashMap<>();
+        int queries = 0;
 
         for (String name : watched) {
             Target t = c.target(name);
@@ -183,38 +204,56 @@ public final class AdminCommands implements SimpleCommand {
                 skipped.add("&8- &f" + name + " &c没配 [servers." + name + "]，不知道实例 uuid");
                 continue;
             }
-            if (!McsmApi.looksLikeUuid(t.uuid)) {
-                skipped.add("&8- &f" + name + " &cuuid 不像 32 位十六进制：&f" + t.uuid);
+            List<String> valid = t.validUuids();
+            if (valid.isEmpty()) {
+                skipped.add("&8- &f" + name + " &c没有可用的 uuid（"
+                        + (t.uuids.isEmpty() ? "没配" : "不像 32 位十六进制") + "）");
                 continue;
             }
-            String url = api.detailUrl(t);
-            String safeUrl = api.mask(url);
-            pending.put(name, plugin.http().request(url, c.mcsm.timeoutMs, api.authHeaders()).handle((r, ex) -> {
-                if (ex != null) {
-                    return "&8- &f" + name + " &c请求异常：&f" + ex.getMessage();
-                }
-                if (!r.success2xx()) {
-                    // ⚠ URL 里带 &（?uuid=..&daemonId=..），不能直接发给玩家：
-                    //   会被当 & 颜色码吃掉 → 只能进后台日志
-                    plugin.logger().warn("[vautostop] 查 " + name + " 的实例状态失败：HTTP "
-                            + r.code + " " + safeUrl);
-                    return "&8- &f" + name + " &7HTTP &6" + r.code
-                            + " &7（完整地址见后台日志，apikey 已打码）";
-                }
-                Integer status = api.parseStatus(r.body);
-                if (status == null) {
-                    return "&8- &f" + name + " &c响应里读不到实例状态码：&7" + abbreviate(r.body);
-                }
-                return "&8- &f" + name + " &7HTTP &a" + r.code + " &7｜实例 &e"
-                        + McsmApi.statusText(status) + " &8(" + status + ")";
-            }));
+            String daemon = api.daemonOf(t);
+            boolean multi = valid.size() > 1;
+            List<CompletableFuture<ProbeLine>> lines = new ArrayList<>();
+            for (String uuid : valid) {
+                String shortId = McsmApi.shortUuid(uuid);
+                String label = multi ? "&8[" + shortId + "] &r" : "";
+                String url = api.detailUrl(uuid, daemon);
+                String safeUrl = api.mask(url);
+                queries++;
+                lines.add(plugin.http().request(url, c.mcsm.timeoutMs, api.authHeaders()).handle((r, ex) -> {
+                    if (ex != null) {
+                        return new ProbeLine("&8- " + label + "&f" + name
+                                + " &c请求异常：&f" + ex.getMessage(), null);
+                    }
+                    if (!r.success2xx()) {
+                        // ⚠ URL 里带 &（?uuid=..&daemonId=..），直接发给玩家会被当颜色码吃掉 → 只进后台日志
+                        plugin.logger().warn("[vautostop] 查 " + name + " 的实例 " + shortId
+                                + " 失败：HTTP " + r.code + " " + safeUrl);
+                        return new ProbeLine("&8- " + label + "&f" + name + " &7HTTP &6" + r.code
+                                + " &7（完整地址见后台日志，apikey 已打码）", null);
+                    }
+                    McsmApi.Probe p = McsmApi.probe(r.body);
+                    if (p.status == null) {
+                        // uuid 不存在 / 没权限：面板照样回 200，但 data 是空的
+                        return new ProbeLine("&8- " + label + "&f" + name
+                                + " &6查不到这个实例 &8(" + p.reason + ")", null);
+                    }
+                    String tail = p.running() ? " &a← 就是这个在跑" : "";
+                    return new ProbeLine("&8- " + label + "&f" + name + " &7HTTP &a" + r.code
+                            + " &7｜实例 &e" + McsmApi.statusText(p.status) + " &8(" + p.status + ")" + tail,
+                            p.running());
+                }));
+            }
+            byServer.put(name, lines);
         }
 
-        int count = pending.size();
-        List<String> intro = new ArrayList<>(skipped);
+        int count = queries;
+        List<String> intro = skipped;
+        List<CompletableFuture<?>> flat = new ArrayList<>();
+        for (List<CompletableFuture<ProbeLine>> ls : byServer.values()) {
+            flat.addAll(ls);
+        }
         // 🔴 千万别在主线程 join()。等全部请求完成后再跳回主线程统一输出。
-        CompletableFuture<Void> all = CompletableFuture.allOf(
-                pending.values().toArray(new CompletableFuture<?>[0]));
+        CompletableFuture<Void> all = CompletableFuture.allOf(flat.toArray(new CompletableFuture<?>[0]));
         all.whenComplete((ignored, ex) -> plugin.runOnMain(() -> {
             plugin.send(source, "&7面板地址：&f" + c.mcsm.url + " &7｜ 守护：&f" + c.mcsm.daemonId);
             plugin.send(source, c.msg("test-start", "count", String.valueOf(count)));
@@ -225,20 +264,39 @@ public final class AdminCommands implements SimpleCommand {
                 plugin.send(source, c.msg("test-none"));
                 return;
             }
-            for (Map.Entry<String, CompletableFuture<String>> e : pending.entrySet()) {
-                String line;
-                try {
-                    line = e.getValue().getNow(null);
-                } catch (RuntimeException oops) {
-                    line = "&8- &f" + e.getKey() + " &c出错：" + oops.getMessage();
+            for (Map.Entry<String, List<CompletableFuture<ProbeLine>>> e : byServer.entrySet()) {
+                int running = 0;
+                for (CompletableFuture<ProbeLine> f : e.getValue()) {
+                    ProbeLine pl;
+                    try {
+                        pl = f.getNow(null);
+                    } catch (RuntimeException oops) {
+                        pl = null;
+                    }
+                    if (pl == null) {
+                        plugin.send(source, "&8- &f" + e.getKey() + " &c无结果");
+                        continue;
+                    }
+                    plugin.send(source, pl.text);
+                    if (Boolean.TRUE.equals(pl.running)) {
+                        running++;
+                    }
                 }
-                plugin.send(source, line == null ? "&8- &f" + e.getKey() + " &c无结果" : line);
+                if (e.getValue().size() > 1) {
+                    plugin.send(source, "&8- &f" + e.getKey() + " &7合计 &f" + e.getValue().size()
+                            + " &7个实例，&a" + running + " &7个在运行"
+                            + (running == 1 ? "（空了就停它）" : ""));
+                }
             }
         }));
     }
 
-    private static String abbreviate(String body) {
-        String s = body == null ? "" : body.replaceAll("\\s+", " ").trim();
-        return s.length() > 120 ? s.substring(0, 120) + "…" : s;
+    /** 32 位 uuid 太长，只显示前 8 位就够认了 */
+    private static String shortJoin(List<String> uuids) {
+        List<String> out = new ArrayList<>();
+        for (String u : uuids) {
+            out.add(McsmApi.shortUuid(u));
+        }
+        return String.join(", ", out);
     }
 }

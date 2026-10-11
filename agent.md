@@ -17,6 +17,11 @@
    `required-empty-checks` 的钳位下限是 **2**（`VasConfig.load` 里 `clamp(…, 2, 1440)`），
    `/vautostop check` 也不得跳过这条 —— 只累加计数器。
    想放宽 = 提高次数，不许改成"一次就关"。
+1.5. 🔴 **uuid 是列表，停机前必须逐个查**：服主有些子服「一个端口挂多个面板实例」
+   （典型如 killer 换游戏 = 换实例），同时至多一个在跑。所以不能认定某一个 uuid，
+   要遍历 `Target.validUuids()` 查 `/api/instance`，**只对明确返回「运行中(3)」的发 stop**。
+   → 配了 2 个以上 uuid 时，`verify-running` **强制按 true**（`IdleMonitor#beginStop` 的 `probe` 变量），
+   否则根本不知道该停谁。
 2. 🟢 **这是"关服"插件，任何不确定的地方都往「不关」那侧倒**
    白名单空 = 谁都不盯；uuid 不是 32 位十六进制 = 跳过；面板查不到状态 = 跳过；
    配置读失败 = 保留旧配置继续跑。加新功能时别破坏这个倾向。
@@ -27,9 +32,13 @@
 ## 三、一次巡检的完整链路（`IdleMonitor#beginStop`）
 
 ```
-① target/uuid 合法性  → ② 宽限期/连续次数/冷却  → ③ verify-running：查面板 /api/instance 必须是「运行中(3)」
-→ ④ 回主线程再数一遍人数（非 0 就放弃）        → ⑤ 发 /api/protected_instance/stop（或 dry-run 只记日志）
+① 取 Target.validUuids()（过滤掉占位/非法值；一个都没有就跳过）
+→ ② 宽限期/连续次数/冷却
+→ ③ 逐个 uuid 查 /api/instance（多个 uuid 时强制），只保留 status==3 的
+→ ④ 回主线程再数一遍人数（非 0 就放弃）
+→ ⑤ 对留在候选里的每个 uuid 发 /api/protected_instance/stop（或 dry-run 只记日志）
 ```
+③ 由 `IdleMonitor#probeRunning` 负责（并行发请求，`allOf` 汇合），⑤ 是 `sendStops`。
 
 每步失败都在 `State#lastResult` 里留原因，玩家用 `/vautostop list` 能看到。
 
@@ -42,6 +51,10 @@
 - ⚠ **URL 带 `&`，不能直接 `sendMessage` 给玩家**（会被当 `&` 颜色码吃掉）→ 只进后台日志。
 - 状态码 `-1 忙碌 / 0 停止 / 1 停止中 / 2 启动中 / 3 运行中`；
   ⚠ 响应顶层的 `"status":200` 是 HTTP 层的码，**实例状态必须从 `data` 里取**。
+- 🔴 **uuid 不存在时面板照样回 HTTP 200**，只是 `data` 是 `null`（或业务码非 200 也没 data）。
+  所以必须在 `McsmApi#probe` 里把它和「实例停着 status=0」区分开：
+  返回 `Probe{status=null, reason=…}`，上层按「状态不明」处理 = **跳过这个 uuid，绝不当成在跑**。
+  这类多半是面板上删过的旧实例还留在配置里 → 用 `warnOnce` 提醒一次「建议从 uuid 列表里删掉」，之后闭嘴。
 - 🔴 `HttpClient` 不要 `.executor(自己的池子)`（线程会互相饿死全超时）——`HttpService` 没设 executor 是对的。
 
 ## 五、构建 / 测试
@@ -52,7 +65,7 @@ JAVA_HOME="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64" mvn -B -o -DskipTests
 # ⚠ 离线必须带 -DskipTests：本机 .m2 缺 surefire-junit3 provider，联网才会自动下载。
 #    别为此在 pom 里写死 skipTests —— CI 那边是联网的，不需要跳。
 
-# 离线自测（不用 Velocity，42 项）
+# 离线自测（不用 Velocity，56 项）
 JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 "$JDK/javac" -encoding UTF-8 -cp target/classes -d target/test-classes tests/VasTest.java
 "$JDK/java" -cp "target/classes;target/test-classes" cn.shijiu.vautostop.VasTest
@@ -74,4 +87,8 @@ JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 - 📌 极简 JSON 的数字字符集必须是完整 `+-0123456789.eE`；少一位就会把 `{"status":3}` 判成非法 JSON。
   ⚠ 顺带记：Git Bash 终端的显示/Grep 输出**渲染会乱序**（曾照它误判别的仓库缺数字字符），
   核对源码字面量要用 PowerShell 打字符码 `[int]$c`。
-- 📌 一次性的告警（uuid 不合法、子服没注册）用 `warned` 去重，reload 时清空 —— 否则每 10 分钟刷一条。
+- 📌 一次性的告警（uuid 一个都不合法、子服没注册、某个 uuid 查不到）用 `warned` 去重，
+  reload 时清空 —— 否则每 10 分钟刷一条。同一个 uuid 的告警 key 带短 uuid，互不覆盖。
+- 🔴 **别手抄源码里的字面量去改源码**：本机 Git Bash / 终端对某些 ASCII 串的显示是乱序的
+  （曾两度把 `0123456789abcdef…` 看成一串别的），Edit 的 old_string 因此对不上。
+  遇到含 uuid/字符集的改动，用 **Python 按正则**改，改完打印 `ord()` 复核字符。

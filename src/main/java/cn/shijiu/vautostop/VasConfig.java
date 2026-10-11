@@ -29,18 +29,36 @@ public final class VasConfig {
         BLACKLIST
     }
 
-    /** 一个受监控的子服：名字（跟 velocity.toml 对齐）+ 它在面板上对应的实例 */
+    /**
+     * 一个受监控的子服：名字（跟 velocity.toml 对齐）+ 它在面板上可能对应的实例。
+     *
+     * <p>为什么 uuid 是<b>列表</b>：服主有些子服共用同一个端口（比如 killer 换游戏靠换实例实现），
+     * 面板上是好几个实例，但<b>同时至多只会有一个在跑</b>。所以要关的时候不能认定某一个，
+     * 得把列表里的 uuid 逐个查一遍，谁在跑就停谁。
+     */
     public static final class Target {
         public final String name;
-        public final String uuid;
+        /** 面板实例 uuid 列表（按配置顺序去重后的结果） */
+        public final List<String> uuids;
         public final String daemonId;
         public final boolean enabled;
 
-        Target(String name, String uuid, String daemonId, boolean enabled) {
+        Target(String name, List<String> uuids, String daemonId, boolean enabled) {
             this.name = name;
-            this.uuid = uuid;
+            this.uuids = Collections.unmodifiableList(new ArrayList<>(uuids));
             this.daemonId = daemonId;
             this.enabled = enabled;
+        }
+
+        /** 列表里看着像面板实例 uuid（32 位十六进制）的那些；占位值/写错的一律滤掉 */
+        public List<String> validUuids() {
+            List<String> out = new ArrayList<>();
+            for (String u : uuids) {
+                if (McsmApi.looksLikeUuid(u)) {
+                    out.add(u);
+                }
+            }
+            return out;
         }
     }
 
@@ -87,7 +105,7 @@ public final class VasConfig {
         m.put("list-line", "&8- &f%server% &7人数 &e%players% &7｜连续空 &e%empty%&8/%checks% &7｜%uuid%&7｜%note%");
         m.put("check-done", "&a已按当前人数跑了一轮巡检（同一个服要连续这样 %checks% 次没人才会真关机）");
         m.put("test-none", "&7没有可查的子服（都是没配 uuid 或面板关了的）");
-        m.put("test-start", "&7正在向面板查询 %count% 个子服的实例状态…");
+        m.put("test-start", "&7正在向面板查询 %count% 个实例的状态…");
         m.put("test-ok", "&8- &f%server% &7HTTP &e%code% &7｜实例 &e%status%");
         m.put("test-fail", "&8- &f%server% &c请求失败 &7%error%");
         m.put("version", "&7VAutoStop &ev%version% &7（Velocity 端 · 拾玖世界）");
@@ -156,13 +174,21 @@ public final class VasConfig {
         FilterMode mode = FilterMode.WHITELIST.name().equalsIgnoreCase(
                 Toml.string(t, "filter.mode", "blacklist").trim()) ? FilterMode.WHITELIST : FilterMode.BLACKLIST;
 
-        // [servers.<名字>]：不管名单怎么配，配了就算一个目标（uuid 不合法时后面会跳过）
+        // [servers.<名字>]：不管名单怎么配，配了就算一个目标（uuid 一个都不合法时后面会跳过）
         LinkedHashMap<String, Target> targets = new LinkedHashMap<>();
         for (String name : serverSectionNames(t)) {
-            String uuid = env(Toml.string(t, "servers." + name + ".uuid", ""), envNames, envMissing).trim();
+            // 🔴 uuid 是「列表」：同一个端口可能挂着多个面板实例（同时至多跑一个）。
+            //    写单个字符串也认（Toml.list 会把标量当一个元素的列表）。
+            List<String> uuids = new ArrayList<>();
+            for (String raw : Toml.list(t, "servers." + name + ".uuid")) {
+                String v = env(raw.trim(), envNames, envMissing).trim();
+                if (!v.isEmpty() && !uuids.contains(v)) {
+                    uuids.add(v);
+                }
+            }
             String daemon = env(Toml.string(t, "servers." + name + ".daemon-id", ""), envNames, envMissing).trim();
             boolean on = Toml.bool(t, "servers." + name + ".enabled", true);
-            targets.put(name, new Target(name, uuid, daemon, on));
+            targets.put(name, new Target(name, uuids, daemon, on));
         }
 
         Mcsm mcsm = new Mcsm(

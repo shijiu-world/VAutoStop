@@ -18,6 +18,10 @@ import java.util.function.Function;
  */
 public final class VasTest {
 
+    private static final String UUID_A = "0123456789abcdef0123456789abcdef";
+    private static final String UUID_B = "fedcba9876543210fedcba9876543210";
+
+
     private static int passed;
     private static int failed;
 
@@ -71,10 +75,33 @@ public final class VasTest {
         check("解析出 4 个 [servers.*] 分节", c.targets.size() == 4);
         check("按名字找目标（大小写不敏感）", c.target("KILLER") != null && c.target("killer") == c.target("KILLER"));
         check("bedwars 配了 enabled=false", !c.target("bedwars").enabled);
-        check("随包模板里的 uuid 是占位值 → 不合法", !McsmApi.looksLikeUuid(c.target("killer").uuid));
-        check("32 位十六进制才算合法 uuid", McsmApi.looksLikeUuid("abcdef0123456789abcdef0123456789"));
+        check("32 位十六进制才算合法 uuid", McsmApi.looksLikeUuid(UUID_A));
         check("分节名提取", VasConfig.serverSectionNames(table).contains("killer")
                 && VasConfig.serverSectionNames(table).size() == 4);
+
+        // ---------- uuid 列表（同一端口挂多个实例）----------
+        check("随包模板里的 uuid 是占位值 → 没有一个合法", c.target("killer").validUuids().isEmpty());
+        check("随包模板 killer 写的是 2 个占位 uuid", c.target("killer").uuids.size() == 2);
+        check("占位值本身不合法", !McsmApi.looksLikeUuid(c.target("killer").uuids.get(0)));
+
+        Map<String, Object> single = new LinkedHashMap<>(table);
+        single.put("servers.killer.uuid", UUID_A);
+        VasConfig sc = VasConfig.load(single);
+        check("单个字符串写法也当成一个元素的列表", sc.target("killer").uuids.size() == 1
+                && UUID_A.equals(sc.target("killer").uuids.get(0)));
+
+        Map<String, Object> dup = new LinkedHashMap<>(table);
+        dup.put("servers.killer.uuid", new ArrayList<>(java.util.List.of(UUID_A, UUID_A, UUID_B)));
+        VasConfig dc = VasConfig.load(dup);
+        check("uuid 去重且保持顺序", dc.target("killer").uuids.size() == 2
+                && UUID_A.equals(dc.target("killer").uuids.get(0))
+                && UUID_B.equals(dc.target("killer").uuids.get(1)));
+
+        Map<String, Object> mixed = new LinkedHashMap<>(table);
+        mixed.put("servers.killer.uuid", new ArrayList<>(java.util.List.of(UUID_A, "实例uuid", UUID_B)));
+        check("validUuids 只留合法的那几个",
+                VasConfig.load(mixed).target("killer").validUuids().equals(java.util.List.of(UUID_A, UUID_B)));
+        check("uuid 缩写成前 8 位", "01234567".equals(McsmApi.shortUuid(UUID_A)));
 
         // ---------- 环境变量 ----------
         Map<String, String> fake = new LinkedHashMap<>();
@@ -102,26 +129,43 @@ public final class VasTest {
         check("顶层 HTTP status 不被当成实例状态",
                 !Integer.valueOf(200).equals(api.parseStatus("{\"status\":200}")));
 
+        // ---------- Probe：实例不存在的各种形态 ----------
+        McsmApi.Probe running = McsmApi.probe("{\"status\":200,\"data\":{\"status\":3}}");
+        check("明确的运行中(3) → running", running.running() && Integer.valueOf(3).equals(running.status));
+        McsmApi.Probe stopped = McsmApi.probe("{\"status\":200,\"data\":{\"status\":0}}");
+        check("明确的停止(0) → 不在跑", !stopped.running() && "停止".equals(stopped.describe()));
+        McsmApi.Probe gone = McsmApi.probe("{\"status\":200,\"data\":null}");
+        check("uuid 不存在（data=null）不算运行中", !gone.running() && gone.status == null);
+        check("uuid 不存在要给出人话原因", gone.reason.contains("没有实例数据"));
+        McsmApi.Probe err500 = McsmApi.probe("{\"status\":500,\"data\":null}");
+        check("面板业务码非 200 也算查不出来", !err500.running() && err500.reason.contains("500"));
+        McsmApi.Probe empty = McsmApi.probe("");
+        check("空响应不算运行中", !empty.running() && "响应为空".equals(empty.reason));
+        McsmApi.Probe junk = McsmApi.probe("<html>");
+        check("非 JSON 不算运行中", !junk.running() && "JSON 解析失败".equals(junk.reason));
+        McsmApi.Probe nodata = McsmApi.probe("{\"status\":200,\"data\":{\"instanceUuid\":\"x\"}}");
+        check("有 data 但没 status 字段 → 不算运行中", !nodata.running() && nodata.status == null);
+
         // ---------- 面板地址与打码 ----------
         Map<String, Object> real = new LinkedHashMap<>(table);
         real.put("mcsm.url", "http://panel.example:23333/");
         real.put("mcsm.daemon-id", "daemon-uuid");
         real.put("mcsm.apikey", "TOPSECRET");
-        real.put("servers.killer.uuid", "abcdef0123456789abcdef0123456789");
+        real.put("servers.killer.uuid", new ArrayList<>(java.util.List.of(UUID_A, UUID_B)));
         VasConfig rc = VasConfig.load(real);
         McsmApi rapi = new McsmApi(rc);
         VasConfig.Target killer = rc.target("killer");
 
         check("结尾多余的斜杠被去掉",
-                rapi.stopUrl(killer).startsWith("http://panel.example:23333/api/protected_instance/stop?"));
+                rapi.stopUrl(killer, UUID_A).startsWith("http://panel.example:23333/api/protected_instance/stop?"));
         check("停实例路径与参数",
-                rapi.stopUrl(killer).contains("uuid=abcdef0123456789abcdef0123456789")
-                        && rapi.stopUrl(killer).contains("daemonId=daemon-uuid"));
-        check("查状态路径", rapi.detailUrl(killer).contains("/api/instance?"));
-        check("apikey 拼在 URL 上", rapi.stopUrl(killer).contains("apikey=TOPSECRET"));
+                rapi.stopUrl(killer, UUID_A).contains("uuid=" + UUID_A)
+                        && rapi.stopUrl(killer, UUID_A).contains("daemonId=daemon-uuid"));
+        check("查状态路径", rapi.detailUrl(killer, UUID_A).contains("/api/instance?"));
+        check("apikey 拼在 URL 上", rapi.stopUrl(killer, UUID_A).contains("apikey=TOPSECRET"));
         check("打码：URL 里的密钥变成 ***",
-                !rapi.mask(rapi.stopUrl(killer)).contains("TOPSECRET")
-                        && rapi.mask(rapi.stopUrl(killer)).contains("***"));
+                !rapi.mask(rapi.stopUrl(killer, UUID_A)).contains("TOPSECRET")
+                        && rapi.mask(rapi.stopUrl(killer, UUID_A)).contains("***"));
         check("必需请求头齐全",
                 "XMLHttpRequest".equals(rapi.authHeaders().get("X-Requested-With"))
                         && "Bearer TOPSECRET".equals(rapi.authHeaders().get("Authorization"))
@@ -129,7 +173,7 @@ public final class VasTest {
         Map<String, Object> noKey = new LinkedHashMap<>(real);
         noKey.put("mcsm.apikey", "");
         McsmApi nk = new McsmApi(VasConfig.load(noKey));
-        check("没配密钥就不带 apikey 参数", !nk.stopUrl(killer).contains("apikey="));
+        check("没配密钥就不带 apikey 参数", !nk.stopUrl(killer, UUID_A).contains("apikey="));
 
         // ---------- 文案 ----------
         check("缺 key 时用内置默认", c.msg("list-none").contains("没有符合过滤条件"));

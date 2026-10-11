@@ -224,8 +224,12 @@ public final class IdleMonitor {
     }
 
     /**
-     * 走完一条「真的要把服关掉」的链路：查状态 → 再数一遍人数 → 发停机请求。
+     * 走完一条「真的要把服关掉」的链路：查每个候选实例的状态 → 再数一遍人数 → 给在跑的实例发停机。
      * 每一步失败都停下来，并在 {@link State#lastResult} 里留下原因。
+     *
+     * <p>uuid 现在是<b>列表</b>（同一端口可能挂着多个实例，同时至多跑一个），所以停机前必须
+     * 逐个查一遍面板，只对明确处于「运行中(3)」的实例发停止 —— 查不出来的、已经停的、正在启停的，
+     * 一律不碰。
      */
     private void beginStop(VasConfig c, RegisteredServer rs, State st) {
         String name = rs.getServerInfo().getName();
@@ -236,10 +240,13 @@ public final class IdleMonitor {
             st.lastResult = "缺 [servers." + name + "]";
             return;
         }
-        if (!McsmApi.looksLikeUuid(t.uuid)) {
+        List<String> uuids = t.validUuids();
+        if (uuids.isEmpty()) {
             warnOnce("bad-uuid:" + name,
-                    "[vautostop] " + name + " 的 uuid 不像面板实例 uuid（应为 32 位十六进制），跳过");
-            st.lastResult = "uuid 不合法";
+                    "[vautostop] " + name + " 没配可用的实例 uuid（应为 32 位十六进制），跳过"
+                            + (t.uuids.isEmpty() ? "：[servers." + name + "] 里连 uuid 这行都没有"
+                                                 : "（写了 " + t.uuids.size() + " 个，没一个像 uuid）"));
+            st.lastResult = t.uuids.isEmpty() ? "没配 uuid" : "uuid 都不合法";
             return;
         }
         if (!c.mcsm.enabled) {
@@ -256,98 +263,37 @@ public final class IdleMonitor {
         st.busy = true;
         McsmApi api = new McsmApi(c);
         long timeout = c.mcsm.timeoutMs;
-
-        CompletableFuture<Boolean> chain = CompletableFuture.completedFuture(true);
-
-        // ① verify-running：先确认实例确实是「运行中(3)」，避免对着已经停的实例反复发停止
-        if (c.mcsm.verifyRunning) {
-            String detailUrl = api.detailUrl(t);
-            String safeDetail = api.mask(detailUrl);
-            chain = chain.thenCompose(ok -> {
-                if (!ok) {
-                    return CompletableFuture.completedFuture(false);
-                }
-                return http.request(detailUrl, timeout, api.authHeaders()).handle((r, ex) -> {
-                    if (ex != null) {
-                        logger.warn("[vautostop] 查 " + name + " 的实例状态出错：" + ex.getMessage());
-                        st.lastResult = "查状态异常";
-                        return false;
-                    }
-                    if (!r.success2xx()) {
-                        logger.warn("[vautostop] 查 " + name + " 实例状态失败：HTTP " + r.code
-                                + " " + safeDetail + " 响应：" + trim(r.body));
-                        st.lastResult = "查状态 HTTP " + r.code;
-                        return false;
-                    }
-                    Integer status = api.parseStatus(r.body);
-                    if (status == null) {
-                        logger.warn("[vautostop] 读不出 " + name + " 的实例状态码，本轮不动手。响应原文："
-                                + trim(r.body));
-                        st.lastResult = "状态码解析失败";
-                        return false;
-                    }
-                    if (status != 3) {
-                        logger.info("[vautostop] " + name + " 面板上不是「运行中」（"
-                                + McsmApi.statusText(status) + "），不用停");
-                        st.lastResult = "非运行中（" + McsmApi.statusText(status) + "）";
-                        return false;
-                    }
-                    return true;
-                });
-            });
+        String daemon = api.daemonOf(t);
+        boolean multi = uuids.size() > 1;
+        // 🔴 配了多个实例，就必须先查状态才知道该停哪个 —— 这时候 verify-running 强制生效
+        boolean probe = c.mcsm.verifyRunning || multi;
+        if (multi && !c.mcsm.verifyRunning) {
+            warnOnce("force-probe:" + name, "[vautostop] " + name + " 配了 " + uuids.size()
+                    + " 个实例（同一端口互斥），必须逐个查状态才知道该停哪个 —— 本服强制按 verify-running=true 处理");
         }
 
-        // ② 停机前再数一次人数：判空到发请求之间隔着 HTTP，这段时间可能有人进来
-        chain = chain.thenCompose(ok -> {
-            if (!ok) {
+        CompletableFuture<List<String>> candidates = probe
+                ? probeRunning(api, daemon, uuids, timeout, name, st)
+                : CompletableFuture.completedFuture(uuids);
+
+        CompletableFuture<Boolean> chain = candidates.thenCompose(running -> {
+            if (running.isEmpty()) {
+                logger.info("[vautostop] " + name + " 的 " + uuids.size() + " 个实例在面板上都不算「运行中」，不用停");
+                st.lastResult = "无运行中的实例";
                 return CompletableFuture.completedFuture(false);
             }
-            return countAgain(rs).thenApply(count -> {
+            logger.info("[vautostop] " + name + " 面板上正在跑的实例 " + running.size() + "/" + uuids.size()
+                    + " 个：" + shortJoin(running));
+            // ② 停机前再数一次人数：判空到发请求之间隔着 HTTP，这段时间可能有人进来
+            return countAgain(rs).thenCompose(count -> {
                 if (count > 0) {
                     logger.info("[vautostop] 正要停 " + name + " 时它又有 " + count + " 人了，取消这次关机");
                     st.players = count;
                     st.emptyChecks = 0;
                     st.lastResult = "关机前有人进来";
-                    return false;
+                    return CompletableFuture.completedFuture(false);
                 }
-                return true;
-            });
-        });
-
-        // ③ 真的发停机请求（或 dry-run 只打日志）
-        boolean dryRun = c.mcsm.dryRun;
-        String stopUrl = api.stopUrl(t);
-        String safeStop = api.mask(stopUrl);
-        chain = chain.thenCompose(ok -> {
-            if (!ok) {
-                return CompletableFuture.completedFuture(false);
-            }
-            if (dryRun) {
-                logger.info("[vautostop] [dry-run] " + name + " 已满足停机条件，本会调用面板停机"
-                        + "（mcsm.dry-run=true，未真正发送）" + safeStop);
-                st.lastResult = "dry-run，未发送";
-                st.stopCount++;
-                return CompletableFuture.completedFuture(true);
-            }
-            return http.request(stopUrl, timeout, api.authHeaders()).handle((r, ex) -> {
-                if (ex != null) {
-                    logger.warn("[vautostop] 停 " + name + " 时出错：" + ex.getMessage());
-                    st.lastResult = "停服请求异常";
-                    return false;
-                }
-                if (!r.success2xx()) {
-                    logger.warn("[vautostop] 停 " + name + " 失败：HTTP " + r.code + " " + safeStop
-                            + " 响应：" + trim(r.body));
-                    st.lastResult = "停服 HTTP " + r.code;
-                    return false;
-                }
-                Integer status = api.parseStatus(r.body);
-                logger.info("[vautostop] " + name + " 已请求面板停机（HTTP " + r.code
-                        + (status == null ? "" : "，面板状态码 " + McsmApi.statusText(status)) + "）");
-                st.lastResult = "已请求停机";
-                st.stopCount++;
-                st.emptyChecks = 0;
-                return true;
+                return sendStops(api, daemon, running, timeout, c.mcsm.dryRun, name, st);
             });
         });
 
@@ -358,6 +304,111 @@ public final class IdleMonitor {
                 st.lastResult = "流程异常";
             }
         });
+    }
+
+    /**
+     * 逐个查 uuid 列表里的实例状态，返回其中<b>明确处于「运行中(3)」</b>的那些。
+     * 查不到的（uuid 不存在/没权限）、明确不是运行中的，都不进结果 —— 只停有把握的那个。
+     */
+    private CompletableFuture<List<String>> probeRunning(McsmApi api, String daemon, List<String> uuids,
+                                                         long timeout, String name, State st) {
+        List<String> running = Collections.synchronizedList(new ArrayList<>());
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (String uuid : uuids) {
+            String shortId = McsmApi.shortUuid(uuid);
+            String detailUrl = api.detailUrl(uuid, daemon);
+            String safeDetail = api.mask(detailUrl);
+            futures.add(http.request(detailUrl, timeout, api.authHeaders()).handle((r, ex) -> {
+                if (ex != null) {
+                    logger.warn("[vautostop] 查 " + name + " 的实例 " + shortId + " 出错：" + ex.getMessage());
+                    st.lastResult = "查状态异常";
+                    return null;
+                }
+                if (!r.success2xx()) {
+                    logger.warn("[vautostop] 查 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
+                            + " " + safeDetail + " 响应：" + trim(r.body));
+                    st.lastResult = "查状态 HTTP " + r.code;
+                    return null;
+                }
+                McsmApi.Probe p = McsmApi.probe(r.body);
+                if (p.status == null) {
+                    // 「实例不存在」是这里最常见的结论 —— 多半是面板上删过的旧实例还留在配置里
+                    warnOnce("no-instance:" + name + ":" + shortId, "[vautostop] " + name + " 的实例 "
+                            + shortId + " 查不到（" + p.reason + "）。如果它已经被删了，"
+                            + "建议把它从 [servers." + name + "] 的 uuid 列表里去掉");
+                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 状态不明（" + p.reason + "），不停它");
+                    st.lastResult = "实例 " + shortId + " 查不到";
+                    return null;
+                }
+                if (p.running()) {
+                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 正在运行 → 就停它");
+                    running.add(uuid);
+                } else {
+                    logger.info("[vautostop] " + name + " 的实例 " + shortId + " 是「"
+                            + McsmApi.statusText(p.status) + "」，不停它");
+                }
+                return null;
+            }));
+        }
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]))
+                .thenApply(v -> new ArrayList<>(running));
+    }
+
+    /** ③ 给这批在跑的实例发停机请求（或 dry-run 只打日志） */
+    private CompletableFuture<Boolean> sendStops(McsmApi api, String daemon, List<String> running,
+                                                 long timeout, boolean dryRun, String name, State st) {
+        if (dryRun) {
+            logger.info("[vautostop] [dry-run] " + name + " 已满足停机条件，本会调用面板停掉 "
+                    + running.size() + " 个实例：" + shortJoin(running)
+                    + "（mcsm.dry-run=true，未真正发送）");
+            st.lastResult = "dry-run，本会停 " + shortJoin(running);
+            st.stopCount += running.size();
+            return CompletableFuture.completedFuture(true);
+        }
+        List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+        for (String uuid : running) {
+            String shortId = McsmApi.shortUuid(uuid);
+            String stopUrl = api.stopUrl(uuid, daemon);
+            String safeStop = api.mask(stopUrl);
+            futures.add(http.request(stopUrl, timeout, api.authHeaders()).handle((r, ex) -> {
+                if (ex != null) {
+                    logger.warn("[vautostop] 停 " + name + " 的实例 " + shortId + " 时出错：" + ex.getMessage());
+                    st.lastResult = "停服请求异常";
+                    return false;
+                }
+                if (!r.success2xx()) {
+                    logger.warn("[vautostop] 停 " + name + " 的实例 " + shortId + " 失败：HTTP " + r.code
+                            + " " + safeStop + " 响应：" + trim(r.body));
+                    st.lastResult = "停服 HTTP " + r.code;
+                    return false;
+                }
+                Integer status = api.parseStatus(r.body);
+                logger.info("[vautostop] " + name + " 的实例 " + shortId + " 已请求面板停机（HTTP " + r.code
+                        + (status == null ? "" : "，面板状态码 " + McsmApi.statusText(status)) + "）");
+                st.lastResult = "已请求停机（" + shortId + "）";
+                st.stopCount++;
+                st.emptyChecks = 0;
+                return true;
+            }));
+        }
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).thenApply(v -> {
+            for (CompletableFuture<Boolean> f : futures) {
+                if (Boolean.TRUE.equals(f.getNow(false))) {
+                    return true;
+                }
+            }
+            st.lastResult = "停服失败，看后台日志";
+            return false;
+        });
+    }
+
+    /** 把一串 32 位 uuid 缩成前 8 位拼起来，日志和命令里好读 */
+    private static String shortJoin(List<String> uuids) {
+        List<String> out = new ArrayList<>();
+        for (String u : uuids) {
+            out.add(McsmApi.shortUuid(u));
+        }
+        return String.join(", ", out);
     }
 
     /** 回到主线程数一次人数（hung 住最多 5 秒就按原人数判断是否继续） */
