@@ -119,3 +119,22 @@ JDK="D:/Code/Java/zulu25.34.17-ca-jdk25.0.3-win_x64/bin"
 - 🔴 **别手抄源码里的字面量去改源码**：本机 Git Bash / 终端对某些 ASCII 串的显示是乱序的
   （曾两度把 `0123456789abcdef…` 看成一串别的），Edit 的 old_string 因此对不上。
   遇到含 uuid/字符集的改动，用 **Python 按正则**改，改完打印 `ord()` 复核字符。
+
+## 七、密钥加解密（ENC1:，v1.2.0 起）
+
+- 需求来源：服主不想把面板 apikey 明文落在 config.toml，又懒得设环境变量。
+  方案：**网页加密 → 填密文 → 插件解密**。加密页 `docs/index.html`，
+  Pages 地址 https://shijiu-world.github.io/VAutoStop/ （main 分支 /docs）。
+- 实现：`KeyCrypto`（AES-256-GCM，密钥 = SHA-256(种子)；输出 `ENC1:` + base64(IV12 + 密文+tag16)）。
+  网页端 Web Crypto 同参数，**已做过双向互通验证**（Java 加密 → JS 解、JS 加密 → Java 解都通过）。
+- 🔴 **只解密「写在文件里的字面量」**：`VasConfig#secret()` 先走 `env()`，
+  再判断原文里有没有 `${env:` —— 有就把环境变量取回来的值**原样返回，不解密**。
+  否则一个好好的明文会被当密文解成空串（这个坑本来就是这么踩出来的需求）。
+  字面量里只有带 `ENC1:` 前缀的才解，没前缀的（普通明文）也原样用。
+- 🔴 **解不开就置空，绝不猜**：base64 非法 / 太短 / GCM tag 校验失败（`AEADBadTagException`）
+  一律返回空串，并把原因塞进 `KeyCrypto.lastError()`，开服/reload 时打一条 warn。
+  宁可面板 403，也不能拿半个错的密钥去怼面板。
+- ⚠ 定位是**混淆级**：种子编在插件里（混淆 = 拆三段 base64 + 掩码逐字节异或），
+  拿到 jar 就能还原。别在文档里吹成"加密安全"。
+- 📌 种子两侧必须完全一致（网页里的 `_P`/`_M` 与 Java 的 `SEED_PARTS`/`SEED_MASK`），
+  改任一侧都要重新生成另一侧 —— 生成脚本思路：base64(seed XOR mask) 再切片。
