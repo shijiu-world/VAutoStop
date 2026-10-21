@@ -204,7 +204,7 @@ public final class VasConfig {
                 Toml.bool(t, "mcsm.enabled", true),
                 env(Toml.string(t, "mcsm.url", ""), envNames, envMissing).trim(),
                 env(Toml.string(t, "mcsm.daemon-id", ""), envNames, envMissing).trim(),
-                env(Toml.string(t, "mcsm.apikey", ""), envNames, envMissing).trim(),
+                secret(Toml.string(t, "mcsm.apikey", ""), envNames, envMissing).trim(),
                 Math.max(500, Toml.integer(t, "mcsm.timeout-ms", 8000)),
                 Toml.bool(t, "mcsm.verify-running", true),
                 Toml.bool(t, "mcsm.dry-run", false)
@@ -287,6 +287,28 @@ public final class VasConfig {
         }
         m.appendTail(sb);
         return sb.toString();
+    }
+
+    /**
+     * 密钥字段专用：先按环境变量规则取值，再决定要不要解密。
+     *
+     * <p>⚠ 只有「直接写在 config.toml 里的字面量」才走解密 ——
+     * {@code ${env:XXX}} 从环境变量取回来的值原样使用，不去解。
+     * 理由：环境变量本来就没落在文件里，再解一次只会把一个好好的明文解成空串。
+     * 字面量里带 {@code ENC1:} 前缀的才当密文解，没前缀的（普通明文）也原样用。
+     */
+    private static String secret(String text, Set<String> names, Set<String> missing) {
+        return secret(text, System::getenv, names, missing);
+    }
+
+    /** 同上，但取值来源可换（离线测试时不用真去设系统环境变量） */
+    static String secret(String text, Function<String, String> lookup, Set<String> names, Set<String> missing) {
+        String v = env(text, lookup, names, missing);
+        if (v == null) {
+            return "";
+        }
+        boolean fromEnv = text != null && text.indexOf("${env:") >= 0;
+        return fromEnv ? v : KeyCrypto.decrypt(v);
     }
 
     // ------------------------------------------------------------------

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAutoStop 面板密钥加密</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#ffffff; --line:#e3e8ef; --text:#1f2430; --muted:#6b7280;
+    --accent:#2f6feb; --accent-soft:#eaf1ff; --ok:#1a7f45; --ok-soft:#e8f6ee;
+    --err:#c02a2a; --err-soft:#fdeceb; --mono:#0f172a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.7;padding:32px 16px 64px}
+  .wrap{max-width:780px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px}
+  h2{font-size:16px;margin:0 0 14px;display:flex;align-items:center;gap:8px}
+  h2 span.n{display:inline-flex;width:22px;height:22px;border-radius:6px;background:var(--accent-soft);
+    color:var(--accent);font-size:13px;align-items:center;justify-content:center;font-weight:700}
+  label{display:block;font-size:13px;color:var(--muted);margin:0 0 6px}
+  textarea,input[type=text]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
+    font-size:14px;color:var(--text);background:#fbfcfe;resize:vertical}
+  textarea:focus,input[type=text]:focus{outline:none;border-color:var(--accent);background:#fff}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center}
+  button{padding:9px 18px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);
+    color:#fff;font-size:14px;cursor:pointer}
+  button.ghost{background:#fff;color:var(--accent)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .out{margin-top:14px;padding:12px;border-radius:8px;background:#0f172a;color:#e6edf7;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;
+    word-break:break-all;white-space:pre-wrap;display:none}
+  .out.show{display:block}
+  .hint{font-size:13px;color:var(--muted);margin-top:10px}
+  .tag{display:none;margin-top:10px;font-size:13px;padding:8px 12px;border-radius:8px}
+  .tag.ok{display:block;background:var(--ok-soft);color:var(--ok)}
+  .tag.err{display:block;background:var(--err-soft);color:var(--err)}
+  ul{margin:10px 0 0;padding-left:20px;font-size:13px;color:var(--muted)}
+  li{margin:4px 0}
+  code{background:#eef1f6;padding:1px 5px;border-radius:4px;font-size:12.5px}
+  .foot{font-size:12.5px;color:var(--muted);text-align:center;margin-top:26px}
+  .foot a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>VAutoStop 面板密钥加密</h1>
+  <p class="sub">把 MCSManager 面板 api-key 加密成 <code>ENC1:</code> 密文，再填进 config.toml。全程在你自己浏览器里算，不联网、不上传。</p>
+
+  <div class="card">
+    <h2><span class="n">1</span>明文 → 密文</h2>
+    <label for="plain">面板 api-key 明文</label>
+    <input type="text" id="plain" placeholder="粘贴面板后台生成的 api-key" autocomplete="off" spellcheck="false">
+    <div class="row">
+      <button id="btnEnc">加密</button>
+      <button class="ghost" id="btnClear">清空</button>
+    </div>
+    <div class="out" id="encOut"></div>
+    <div class="tag" id="encTag"></div>
+    <div class="hint" id="encHint" style="display:none">
+      复制上面的整串，填到 config.toml 的 <code>apikey</code>：
+      <div class="out show" id="cfgLine" style="margin-top:8px"></div>
+      <div class="row">
+        <button class="ghost" id="btnCopy">复制密文</button>
+        <button class="ghost" id="btnCopyLine">复制整行</button>
+      </div>
+    </div>
+    <ul>
+      <li>同一个明文每次加密出来的串都不一样（随机 IV），这是正常的，哪个都能用。</li>
+      <li>填完保存，服务器里执行 <code>/vautostop reload</code> 即可，不用重启。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2><span class="n">2</span>密文 → 明文（排查用）</h2>
+    <label for="cipher">ENC1: 开头的密文</label>
+    <textarea id="cipher" rows="3" placeholder="ENC1:..." spellcheck="false"></textarea>
+    <div class="row"><button id="btnDec">解密</button></div>
+    <div class="out" id="decOut"></div>
+    <div class="tag" id="decTag"></div>
+    <div class="hint">解不出来只有两种可能：这串不是本页生成的（种子不同），或者复制时被截断了。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="n">3</span>说明</h2>
+    <ul>
+      <li>算法：AES-256-GCM，密钥 = SHA-256(内置种子)，输出 = <code>ENC1:base64(IV+密文+校验标签)</code>。</li>
+      <li>插件端只认「直接写在 config.toml 里」的值：带 <code>ENC1:</code> 前缀才解密，没前缀的明文原样使用。</li>
+      <li><code>${env:XXX}</code> 环境变量取回来的值<b>不解密</b>——它本来就不在文件里，没必要再包一层。</li>
+      <li>这是防「配置文件被随手拷走 / 截图外传 / 丢进仓库」的混淆级保护，不是防逆向：种子编在插件里，拿到 jar 的人理论上能还原。真要严防死守，仍然优先用环境变量。</li>
+      <li>本页不保存任何输入，刷新即清空；可整页保存到本地离线使用。</li>
+    </ul>
+  </div>
+
+  <p class="foot">拾玖世界 · <a href="https://github.com/shijiu-world/VAutoStop">VAutoStop</a></p>
+</div>
+
+<script>
+(function () {
+  // 种子：拆成几段 base64，运行时拼起来再和掩码逐字节异或（别直接写明文）
+  var _P = ["TykcRT8rPldVbA5R", "OwtzWnpGB0MDDwcg", "H1AtIGoIIRhQFVcA"];
+  var _M = "vautostop-idle-2026";
+
+  function _seed() {
+    var b = atob(_P.join('')), s = '', i;
+    for (i = 0; i < b.length; i++) {
+      s += String.fromCharCode(b.charCodeAt(i) ^ _M.charCodeAt(i % _M.length));
+    }
+    return s;
+  }
+
+  function _b64(u8) {
+    var s = '', i;
+    for (i = 0; i < u8.length; i++) { s += String.fromCharCode(u8[i]); }
+    return btoa(s);
+  }
+
+  function _unb64(str) {
+    var bin = atob(str), u8 = new Uint8Array(bin.length), i;
+    for (i = 0; i < bin.length; i++) { u8[i] = bin.charCodeAt(i); }
+    return u8;
+  }
+
+  function _key() {
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(_seed()))
+      .then(function (h) { return crypto.subtle.importKey('raw', h, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); });
+  }
+
+  function _fail(el, msg) {
+    el.className = 'tag err';
+    el.textContent = msg;
+  }
+
+  function encrypt(plain) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    return _key().then(function (k) {
+      return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, k, new TextEncoder().encode(plain));
+    }).then(function (ct) {
+      var c = new Uint8Array(ct), out = new Uint8Array(iv.length + c.length);
+      out.set(iv, 0); out.set(c, iv.length);
+      return 'ENC1:' + _b64(out);
+    });
+  }
+
+  function decrypt(text) {
+    var body = text.trim().replace(/^ENC1:/i, '').trim();
+    var all = _unb64(body);
+    if (all.length <= 12) { return Promise.reject(new Error('密文太短，像是被截断了')); }
+    var iv = all.slice(0, 12), ct = all.slice(12);
+    return _key().then(function (k) {
+      return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, k, ct);
+    }).then(function (p) { return new TextDecoder().decode(p); });
+  }
+
+  function copy(text, tagEl) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        tagEl.className = 'tag ok'; tagEl.textContent = '已复制到剪贴板';
+      }, function () { _fail(tagEl, '复制失败，请手动选中上面的文本复制'); });
+    } else {
+      _fail(tagEl, '当前环境不支持自动复制，请手动选中复制');
+    }
+  }
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  $('btnEnc').addEventListener('click', function () {
+    var plain = $('plain').value.trim(), tag = $('encTag'), out = $('encOut');
+    if (!plain) { _fail(tag, '先填明文 api-key'); out.className = 'out'; $('encHint').style.display = 'none'; return; }
+    if (!window.crypto || !crypto.subtle) { _fail(tag, '当前页面不是安全上下文，请用 https 打开本页'); return; }
+    encrypt(plain).then(function (ct) {
+      out.textContent = ct; out.className = 'out show';
+      $('cfgLine').textContent = 'apikey = "' + ct + '"';
+      $('encHint').style.display = 'block';
+      return decrypt(ct);                       // 立刻回解一次做自检
+    }).then(function (back) {
+      if (back === plain) {
+        tag.className = 'tag ok'; tag.textContent = '加密完成，回解校验通过（插件端能解出来）';
+      } else {
+        _fail(tag, '回解结果对不上，别用这串：' + back);
+      }
+    })['catch'](function (e) { _fail(tag, '加密失败：' + e.message); });
+  });
+
+  $('btnClear').addEventListener('click', function () {
+    $('plain').value = '';
+    $('encOut').className = 'out'; $('encTag').className = 'tag';
+    $('encHint').style.display = 'none';
+  });
+
+  $('btnCopy').addEventListener('click', function () { copy($('encOut').textContent, $('encTag')); });
+  $('btnCopyLine').addEventListener('click', function () { copy($('cfgLine').textContent, $('encTag')); });
+
+  $('btnDec').addEventListener('click', function () {
+    var text = $('cipher').value.trim(), tag = $('decTag'), out = $('decOut');
+    if (!text) { _fail(tag, '先填 ENC1: 开头的密文'); out.className = 'out'; return; }
+    if (text.indexOf('ENC1:') !== 0) { _fail(tag, '这串不是 ENC1: 开头，本页只解自己生成的密文'); out.className = 'out'; return; }
+    decrypt(text).then(function (plain) {
+      out.textContent = plain; out.className = 'out show';
+      tag.className = 'tag ok'; tag.textContent = '解出来了（种子对得上）';
+    })['catch'](function () { _fail(tag, '解不出来 —— 种子对不上，或复制时被截断了'); out.className = 'out'; });
+  });
+})();
+</script>
+</body>
+</html>

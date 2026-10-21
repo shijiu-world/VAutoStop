@@ -176,6 +176,13 @@ public final class VAutoStop {
             logger.warn("这些环境变量没设置，相关项按空处理：" + String.join(", ", c.envMissing)
                     + "（要在开服脚本里 export 再启动代理）");
         }
+
+        // 密文密钥解不开时说一声 —— 不然表现为「面板一直 403 / 停不了服」，很难往配置上想
+        String cryptErr = KeyCrypto.lastError();
+        if (cryptErr != null) {
+            logger.warn("[mcsm] apikey 是 ENC1: 密文但解不出来：" + cryptErr
+                    + "（到配套加密页重新生成一次再填，别手改密文里的字符）");
+        }
         List<String> bad = new ArrayList<>();
         for (VasConfig.Target t : c.targets.values()) {
             if (t.validUuids().isEmpty()) {
